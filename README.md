@@ -13,7 +13,7 @@ Read the functions documentation just below to understand how ColdHook must be u
   - Ability to re-calculate special instructions if needed.
 
 ## Build requirements
-- MSVC 2013 build tools are required to compile this project.
+- MSVC 2019 or higher build tools are required to compile this project.
 
 # Functions documentation
 
@@ -205,10 +205,14 @@ Read the functions documentation just below to understand how ColdHook must be u
     ***This function stops the ColdHook service and unhooks the data if any***
     -  #### Syntax
         ```cpp
-            bool ServiceGlobalShutDown(int32_t* OutErrorCode);
+            bool ServiceGlobalShutDown(bool UnHook, int32_t* OutErrorCode);
          ```
     - ### Arguments
     
+		- `UnHook`	
+		
+			If this argument is set to **true**, every registered hooked function/address bytes will be restored, otherwise set it to **false**.
+			
         - `OutErrorCode`
         
             A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
@@ -343,7 +347,6 @@ Read the functions documentation just below to understand how ColdHook must be u
           
 ## Credits
 - [Zydis](https://github.com/zyantific/zydis) disassembler for the hook trampoline
-- [Keystone](https://github.com/keystone-engine/keystone) Inline assembler for special instructions
 - MSDN: Documentation style.
 
 ## Some notes

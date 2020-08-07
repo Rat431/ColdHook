@@ -5,1441 +5,1676 @@
 
 #include "ColdHook.h"
 
+#ifdef _WIN64
+#define VALID_MACHINE IMAGE_FILE_MACHINE_AMD64
+typedef signed long long DisplacementVar;
+static const BYTE AbsJumpRaw[14] = {
+	0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00
+};
+#else
+static const BYTE AbsJumpRaw[10] = {
+	0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+#define VALID_MACHINE IMAGE_FILE_MACHINE_I386
+typedef signed long DisplacementVar;
+#endif
+
+static const BYTE OffsetJumpLong[OFFSET_JUMP_LONG_HOOK_SIZE] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
+static const BYTE OffsetJumpShort[OFFSET_JUMP_SHORT_HOOK_SIZE] = { 0xEB, 0x00 };
+
+
 namespace ColdHook_Vars
 {
 	bool Inited = false;
 	int32_t CurrentID = 0;
-	std::multimap<int32_t, Hook_Info> RegisteredHooks;
+	ZydisDecoder decoder;
+
+	std::multimap<int32_t, Hook_Info*> RegisteredHooks;
 	std::mutex Thread;
 
-	ZydisDecoder decoder;
-	ks_engine* ks;
+	const char* pSystemMods[3] = { "kernel32.dll", "kernelbase.dll", "ntdll.dll" };
 }
 
 namespace ColdHook_Service
 {
 	// Private functions:
-	static const std::string X86Instructions[23] = { "JMP", "JZ", "JNZ", "JG", "JGE", "JA", "JAE", "JL", "JLE", "JB", "JBE", "JO",
-			"JNO", "JE", "JNE", "JS", "JNS", "JCXZ", "JECXZ", "JRCXZ", "LOOP", "LOOPCC", "CALL" };
-	static bool IsAssemblerNeeded(const char* Instruction)
+	static void* WalkThroughJumpIfPossible(void* pMemory)
 	{
-		size_t ISLength = std::strlen(Instruction);
+		void* curaddr				= pMemory;
+		OffsetTypes Type			= TUNKNOWN;
 
-		for (size_t c = 0; c < ISLength; c++) {
-			for (int i = 0; i < 23; i++) {
-				std::string TempIn = X86Instructions[i];
-				std::transform(TempIn.begin(), TempIn.end(), TempIn.begin(), ::tolower);
-				if (std::memcmp(&Instruction[c], TempIn.c_str(), std::strlen(TempIn.c_str())) == 0) {
-					size_t found = 0;
-					bool GotOne = false;
-					bool SpaceReached = false;
-					for (size_t b = c; b < ISLength; b++) {
-						if (!SpaceReached) {
-							if (Instruction[b] == 0x20) {
-								SpaceReached = true;
-								if (Instruction[b + 1] == '0' && Instruction[b + 2] == 'x') {
-									size_t dst = ISLength - (b + 3);
-
-									if ((dst / 2) != sizeof(void*)) {
-										return false;
-									}
-									// Looks like we have an address 
-									return true;
-								}
-							}
-						}
-						if (SpaceReached) {
-							if (GotOne) {
-								if (Instruction[b] == ']') {
-									// Is an Address?
-									if (Instruction[found] == '0' && Instruction[found + 1] == 'x') {
-										size_t dst = b - (found + 2);
-
-										if ((dst / 2) != sizeof(void*)) {
-											return false;
-										}
-										// Looks like we have an address 
-										return true;
-									}
-									// Looks like we don't have an address 
-									return false;
-								}
-							}
-							else {
-								if (Instruction[b] == '[') {
-									found = b + 1;
-									GotOne = true;
-								}
-							}
-						}
+		// get real address from jump table and stop when real code is found 
+		__try {
+			if (curaddr) {
+				Type = GetInstructionOffType(curaddr);
+				if (Type == TOFFSET_LONG_JUMP || Type == TOFFSET_SHORT_JUMP || Type == TABSOLUTE_JUMP || Type == TABSOLUTE_JUMP_CUSTOM) {
+					curaddr = GetAddressFromOffset(curaddr, Type, 0, 0, true, true);
+					if (curaddr != pMemory) {
+						return WalkThroughJumpIfPossible(curaddr);
 					}
-					// Looks like we don't have an address 
-					return false;
 				}
 			}
 		}
-
-		// Check for a constant pointer 
-		size_t found = 0;
-		bool GotOne = false;
-		for (size_t i = 0; i < ISLength; i++) {
-			if (Instruction[i] == '[') {
-				found = i + 1;
-				GotOne = true;
-			}
-			if (GotOne) {
-				if (Instruction[i] == ']') {
-					// Is an Address?
-					if (Instruction[found] == '0' && Instruction[found + 1] == 'x') {
-						size_t dst = i - (found + 2);
-
-						if ((dst / 2) != sizeof(void*)) {
-							return false;
-						}
-						// Looks like we have an address 
-						return true;
-					}
-					// Looks like we don't have an address 
-					return false;
-				}
-			}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			curaddr = nullptr;
+			return curaddr;
 		}
-		return false;
+		return curaddr;
 	}
-
-	//  Disassembler call
-	static char Instructions[400] = { 0 };
-	static unsigned int DisasmRange(SIZE_T* OutPutInstructionsSize, ULONG_PTR* OutNextInst, SIZE_T HookSize, ULONG_PTR BaseAddressFormat, void* Buffer, void* TrampolineBuffer)
+	static void* GetAddressFromOffset(void* Base, OffsetTypes Type, size_t DispOffset, size_t InsLength, bool bReturnDefault, bool bGetInternalP)
 	{
-		if (OutPutInstructionsSize > NULL && OutNextInst > NULL && BaseAddressFormat && Buffer > NULL)
+		void* ReturnAddress					= nullptr;
+		void* Addr							= nullptr;
+		void* DefaultAddress				= nullptr;
+
+		ULONG_PTR uBase						= (ULONG_PTR)Base;
+
+		if (uBase)
 		{
-			// Declare some function variables
-			bool Is64Bit = ColdHook_Service::Is64BitProcess();
-			unsigned int DecodedI = 0;
-			ZydisFormatter formatter;
-			ZyanUSize offset = 0;
-			const ZyanUSize length = 0x1000;
-			ZydisDecodedInstruction instruction;
-
-			size_t count;
-			unsigned char* encode;
-			size_t size;
-
-			// Instructions size
-			SIZE_T LSize = 0;
-			SIZE_T LSize2 = 0;
-
-			memset(Instructions, 0, sizeof(Instructions));
-
-			// We disassemble 0x100 bytes
-			ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-
-			ZyanU64 runtime_address = BaseAddressFormat;
-			while (ZydisDecoderDecodeBuffer(&ColdHook_Vars::decoder, (void*)((ULONG_PTR)Buffer + offset), length - offset,
-				&instruction) == ZYAN_STATUS_SUCCESS)
+			switch (Type)
 			{
-				if (LSize >= HookSize) {
-					// Store the next instruction
-					*OutNextInst = runtime_address;
-					break;
-				}
-				// Format & print the binary instruction structure to human readable format
-				ZydisFormatterFormatInstruction(&formatter, &instruction, Instructions, sizeof(Instructions),
-					runtime_address);
+			case TSPECIAL_JUMP_C:
+				Addr = (void*)((uBase + OFFSET_JUMP_COND_SHORT) + (*(char*)(uBase + sizeof(BYTE))));
+				break;
+			case TCONDITIONAL_LONG_JUMP:
+				Addr = (void*)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP) + (*(int*)(uBase + sizeof(WORD))));
+				break;
+			case TCONDITIONAL_SHORT_JUMP:
+				Addr = (void*)((uBase + OFFSET_JUMP_COND_SHORT) + (*(char*)(uBase + sizeof(BYTE))));
+				break;
+			case TOFFSET_SHORT_JUMP:
+				Addr = (void*)((uBase + OFFSET_JUMP_COND_SHORT) + (*(char*)(uBase + sizeof(BYTE))));
+				break;
+			case TOFFSET_LONG_JUMP:
+				Addr = (void*)((uBase + OFFSET_JUMP_LONG_AND_OFFSET_CALL) + (*(int*)(uBase + sizeof(BYTE))));
+				break;
+			case TOFFSET_CALL:
+				Addr = (void*)((uBase + OFFSET_JUMP_LONG_AND_OFFSET_CALL) + (*(int*)(uBase + sizeof(BYTE))));
+				break;
+			case TABSOLUTE_CALL:
+				Addr = (bGetInternalP == true) ? *(void**)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP) + (*(int*)(uBase + sizeof(WORD)))) :
+					(void*)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP) + (*(int*)(uBase + sizeof(WORD))));
+				break;
+			case TABSOLUTE_JUMP:
+				Addr = (bGetInternalP == true) ? *(void**)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP) + (*(int*)(uBase + sizeof(WORD)))) :
+					(void*)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP) + (*(int*)(uBase + sizeof(WORD))));
+				break;
+			case TABSOLUTE_JUMP_CUSTOM:
+				Addr = (bGetInternalP == true) ? *(void**)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP + sizeof(BYTE)) + (*(int*)(uBase + sizeof(BYTE) + sizeof(WORD)))) :
+					(void*)((uBase + ABS_CALL_AND_COND_OFFSET_LONG_JUMP + sizeof(BYTE)) + (*(int*)(uBase + sizeof(BYTE) + sizeof(WORD))));
+				break;
+			default:
+				Addr = (Is64BitProcess() == true) ? (void*)((uBase + InsLength) + (*(int*)(uBase + DispOffset))) : *(void**)(uBase + DispOffset);
+				break;
+			}
 
-				if (ColdHook_Service::IsAssemblerNeeded(Instructions)) {	
-					int AsmD = ks_asm(ColdHook_Vars::ks, Instructions, (ULONG_PTR)TrampolineBuffer + LSize2, &encode, &size, &count);
-					if (AsmD != KS_ERR_OK) {
-						return NULL;
+			DefaultAddress = (bReturnDefault == true) ? Base : nullptr;
+			ReturnAddress = (IsValidMem(Addr, false) == true) ? Addr : DefaultAddress;
+		}
+		return ReturnAddress;
+	}
+	static void* BeckupOriginalInstructions(void* pTarget, void* pTrampolineStart, size_t JumpHookS, size_t* pOutDLength)
+	{
+		void* TargetDest					= nullptr;
+		size_t DSize						= 0;
+		size_t RDSize						= 0;
+
+		ZyanUSize offset					= 0;
+		ZyanUSize length					= 0x1000;
+		ZydisDecodedInstruction instruction;
+		ULONG_PTR CurInsP					= (ULONG_PTR)pTarget;
+		ULONG_PTR CurTInsP					= (ULONG_PTR)pTrampolineStart;
+
+		while (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&ColdHook_Vars::decoder, (void*)((ULONG_PTR)pTarget + offset), length - offset,
+			&instruction))) {
+			bool HasDisp = false;
+			size_t EncodedInsSize = 0;
+			int DispValue = 0;
+
+			if (DSize >= JumpHookS) {
+				TargetDest = (void*)CurInsP;
+				break;
+			}
+
+			// search if the current instruction has a displacement
+			HasDisp = (instruction.attributes & ZYDIS_ATTRIB_IS_RELATIVE) ? ZYAN_TRUE : ZYAN_FALSE;
+			if (HasDisp) {
+				for (int i = 0; i < instruction.operand_count; i++) {
+					if (instruction.operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+						if (instruction.operands[i].mem.type != ZYDIS_MEMOP_TYPE_INVALID) {
+							if (instruction.operands[i].mem.disp.has_displacement) {
+								DispValue = instruction.operands[i].mem.disp.value;
+								break;
+							}
+						}
 					}
-					memcpy((void*)((ULONG_PTR)TrampolineBuffer + LSize2), (void*)encode, size);
-					LSize2 += size;
-					size = 0;
-					ks_free(encode);
+				}
+			}
+
+			EncodedInsSize = FixInstruction((void*)CurInsP, (void*)CurTInsP, HasDisp, DispValue, instruction.length);
+			if (!EncodedInsSize) {
+				break;
+			}
+
+			CurTInsP += EncodedInsSize;
+			CurInsP += instruction.length;
+
+			RDSize += EncodedInsSize;
+			offset += instruction.length;
+			DSize += instruction.length;
+		}
+
+		if (pOutDLength) {
+			*pOutDLength = RDSize;
+		}
+		return TargetDest;
+	}
+	static void* FindTrampoline(void* StartBaseAddress, size_t Size, bool UseCodeCave, int* pAllocated, DWORD* pCaveOProtection)
+	{
+		bool Found							= false;
+		int Allocated						= 0;
+		DWORD CaveOProtection				= 0;
+
+		void* Trampoline					= nullptr;
+		void* ModuleBase					= nullptr;
+		void* MemBlockBase					= nullptr;
+
+		MEMORY_BASIC_INFORMATION mem;
+		MEMORY_BASIC_INFORMATION memb;
+
+		size_t maxDelta2gb					= MAX_RANGE_DELTA_P;
+
+		IMAGE_SECTION_HEADER* pSec			= nullptr;
+		IMAGE_NT_HEADERS* pNt				= nullptr;
+
+		// get mem infos
+		if (IsValidMem(StartBaseAddress, false)) {
+			if (VirtualQuery(StartBaseAddress, &mem, sizeof(MEMORY_BASIC_INFORMATION))) {
+				ModuleBase = mem.AllocationBase;
+				MemBlockBase = mem.BaseAddress;
+			}
+
+			// first thing try to find code cave inside the module 
+			if (ModuleBase) {
+				if (IsValidHeader(ModuleBase)) {
+					if (UseCodeCave) {
+						void* StartBase = nullptr;
+						bool checkagain = true;
+						size_t SecSize = 0;
+						ULONG_PTR Base = 0;
+
+						// search code cave inside the address section 
+						if (SearchAddressThroughSecs(ModuleBase, StartBaseAddress, &StartBase, &SecSize)) {
+							Base = (ULONG_PTR)StartBase;
+							size_t howmany = 0;
+							for (size_t i = 0; i < SecSize; i++, Base++) {
+								if (howmany == Size) {
+									Trampoline = (void*)((ULONG_PTR)Base - howmany);
+									Found = true;
+									DWORD Oldp;
+									if (!VirtualProtect(Trampoline, Size, PAGE_EXECUTE_READWRITE, &Oldp)) {
+										Trampoline = nullptr;
+										Found = false;
+										howmany = 0;	// continue, we can't use that address 
+									}
+									else {
+										CaveOProtection = Oldp;
+										break;
+									}
+								}
+								if (*(PBYTE)Base == 0xCC || *(PBYTE)Base == 0x90)
+									howmany++;
+								else
+									howmany = 0;
+							}
+						}
+						if (!Found) {
+							Base = 0;
+							pNt = (IMAGE_NT_HEADERS*)((ULONG_PTR)ModuleBase + ((IMAGE_DOS_HEADER*)ModuleBase)->e_lfanew);
+							pSec = IMAGE_FIRST_SECTION(pNt);
+							size_t howmany = 0;
+							bool breakloop = false;
+
+							// search code cave inside the module space if possible...
+							for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSec++) {
+								breakloop = false;
+								Base = 0;
+								if (pSec->Characteristics & (0x00000020 | 0x20000000 | 0x40000000)) {
+									Base = (ULONG_PTR)pSec->VirtualAddress + (ULONG_PTR)ModuleBase;
+									for (size_t i = 0; i < pSec->SizeOfRawData; i++, Base++) {
+										if (howmany == Size) {
+											Trampoline = (void*)((ULONG_PTR)Base - howmany);
+											Found = true;
+											DWORD Oldp;
+											if (!VirtualProtect(Trampoline, Size, PAGE_EXECUTE_READWRITE, &Oldp)) {
+												Trampoline = nullptr;
+												Found = false;
+												howmany = 0;	// continue, we can't use that address 
+											}
+											else {
+												CaveOProtection = Oldp;
+												breakloop = true;
+												break;
+											}
+										}
+										if (*(PBYTE)Base == 0xCC || *(PBYTE)Base == 0x90)
+											howmany++;
+										else
+											howmany = 0;
+									}
+								}
+								if (breakloop)
+									break;
+							}
+						}
+					}
+				}
+			}
+
+			// it wasn't possible to use memory from code cave or it wasn't requested, try to allocate. 
+			if (!Found) {
+				if (Is64BitProcess()) {
+					// search before and ahead...
+					ULONG_PTR StartBaseL = (ULONG_PTR)StartBaseAddress;
+					ULONG_PTR BaseL = 0;
+					size_t DivSize = (maxDelta2gb / 0x1000);
+
+					bool CheckBefore = true;
+					bool AllocateEveryWhere = true;
+
+					BaseL = StartBaseL;
+					for (size_t i = 0; i < DivSize; i++) {
+						memset(&memb, 0, sizeof(MEMORY_BASIC_INFORMATION));
+						if (VirtualQuery((void*)BaseL, &memb, sizeof(MEMORY_BASIC_INFORMATION))) {
+							if (memb.State == MEM_FREE) {
+								Trampoline = VirtualAlloc(memb.BaseAddress, MAX_TRAMPSIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+								if (Trampoline) {
+									CheckBefore = false;
+									AllocateEveryWhere = false;
+									Allocated = ALLOCATED_64_2GB_CLOSE;
+									break;
+								}
+							}
+						}
+						else
+							break;
+						BaseL += 0x1000;
+					}
+					if (CheckBefore) {
+						BaseL = StartBaseL;
+						for (size_t i = 0; i < DivSize; i++) {
+							memset(&memb, 0, sizeof(MEMORY_BASIC_INFORMATION));
+							if (VirtualQuery((void*)BaseL, &memb, sizeof(MEMORY_BASIC_INFORMATION))) {
+								if (memb.State == MEM_FREE) {
+									Trampoline = VirtualAlloc(memb.BaseAddress, MAX_TRAMPSIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+									if (Trampoline) {
+										AllocateEveryWhere = false;
+										Allocated = ALLOCATED_64_2GB_CLOSE;
+										break;
+									}
+								}
+							}
+							else
+								break;
+							BaseL -= 0x1000;
+						}
+					}
+					if (AllocateEveryWhere) {
+						// we'll use a constant jump 
+						Trampoline = VirtualAlloc(nullptr, MAX_TRAMPSIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+						Allocated = RANDOM_ALLOCATED_64;
+					}
 				}
 				else {
-					memcpy((void*)((ULONG_PTR)TrampolineBuffer + LSize2), (void*)runtime_address, instruction.length);
-					LSize2 += instruction.length;
+					Trampoline = VirtualAlloc(nullptr, MAX_TRAMPSIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+					Allocated = RANDOM_ALLOCATED_32;
 				}
-
-				offset += instruction.length;
-				runtime_address += instruction.length;
-				LSize += instruction.length;
-				DecodedI++;
 			}
-			*OutPutInstructionsSize = LSize2;
-			return DecodedI;
 		}
-		return NULL;
+		
+		if (pAllocated) {
+			*pAllocated = Allocated;
+		}
+		if (pCaveOProtection) {
+			*pCaveOProtection = CaveOProtection;
+		}
+		return Trampoline;
 	}
 
-	// Generate base address
-	static void* AllocateTrampoline(ULONG_PTR StartBaseAddress, SIZE_T PageS, int32_t* OutErrorCode, SIZE_T* ChangedHookSize)
+	static size_t FixInstruction(void* pTarget, void* pNewPointer, bool bIsRelative, int DispValue, size_t CurrentInsLength)
 	{
-		// Declare some function variables
-		ULONG_PTR* StartingBaseAddress = NULL;
-		SIZE_T AddressBytesCounter = NULL;
-		void* ReturnAddress = NULL;
-		SIZE_T Distance = NULL;
-		bool IsBack = false;
+		if (!pTarget || !pNewPointer || !CurrentInsLength) { return 0; }
 
-		if (StartBaseAddress > NULL)
-		{
-			if (ColdHook_Service::Is64BitProcess())
-			{
-				StartingBaseAddress = (ULONG_PTR*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+		size_t EncodedInsSize						= 0;
+		int NewDisplaceMent							= 0;
+		void* DestAddress							= nullptr;
 
-				if (StartingBaseAddress > NULL)
-				{
-					*StartingBaseAddress = StartBaseAddress;
+		bool ReCompileJumpN							= false;
+		bool IsLong									= false;
+		bool Falied									= false;
 
-					// Loop untill we find a right address 
-					for (;;)
-					{
-						// We give a range of 40MB
-						if (Distance > 0x41943040) {
-							if (IsBack) {
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_OUT_RANGE;
-								}
-								// In that case we'll use another method to jump.
-								*ChangedHookSize = 0xE;
-								ReturnAddress = VirtualAlloc(NULL, PageS, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-								return ReturnAddress;
-							}
-							// We try searching before the module address
-							Distance = NULL;
-							*StartingBaseAddress = StartBaseAddress;
-							IsBack = true;
+		if (!bIsRelative) {
+			memcpy(pNewPointer, pTarget, CurrentInsLength);
+			return CurrentInsLength;
+		}
+		else {
+			size_t DDisplacementOffset				= 0;
+			InstructionType IInstructionType		= T_GENERAL_UNKNOWN;
+			OffsetTypes OffsetInstructionType		= TUNKNOWN;
+
+			// instruction must be fixed.
+			OffsetInstructionType = GetInstructionOffType(pTarget);
+			if (OffsetInstructionType != TUNKNOWN) {
+				// we can fix with our code
+				DestAddress = GetAddressFromOffset(pTarget, OffsetInstructionType, 0, 0, false, false);
+				if (DestAddress) {
+					IInstructionType = GetInstructionTypeFromOffsetType(OffsetInstructionType);
+					NewDisplaceMent = BuildInstructionTypeDisplaceMent(DestAddress, pNewPointer, IInstructionType,
+						&EncodedInsSize, &DDisplacementOffset, 0, &IsLong, &Falied);
+					if (!Falied) {
+						ReCompileJumpN = MustInstructionBeFixed(OffsetInstructionType, IsLong);
+						EncodeDisplaceMentInstruction(pNewPointer, pTarget, NewDisplaceMent, IInstructionType, ReCompileJumpN, IsLong, EncodedInsSize,
+							DDisplacementOffset);
+					}
+				}
+			}
+			else {
+				DDisplacementOffset = GetDisplacementOffset(pTarget, DispValue, CurrentInsLength, &Falied);
+				if (!Falied) {
+					DestAddress = GetAddressFromOffset(pTarget, OffsetInstructionType, DDisplacementOffset, CurrentInsLength, false, false);
+					if (DestAddress) {
+						NewDisplaceMent = BuildInstructionTypeDisplaceMent(DestAddress, pNewPointer, IInstructionType,
+							&EncodedInsSize, nullptr, CurrentInsLength, &IsLong, &Falied);
+						EncodeDisplaceMentInstruction(pNewPointer, pTarget, NewDisplaceMent, IInstructionType, ReCompileJumpN, IsLong, EncodedInsSize,
+							DDisplacementOffset);
+					}
+				}
+			}
+		}
+		return EncodedInsSize;
+	}
+	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFalied)
+	{
+		// search for the displacement value offset relative to beginning of the instruction.
+		bool Falied						= true;
+		size_t DispOffRet				= 0;
+
+		if (pInstruction && InsLength) {
+			for (size_t i = (InsLength - sizeof(int)); i > 0; i--) {
+				if (*(int*)((ULONG_PTR)pInstruction + i) == DisplaceMent) {
+					Falied = false;
+					DispOffRet = i;
+					break;
+				}
+			}
+			if (Falied) {
+				// search for 1 signed byte
+				for (size_t i = (InsLength - sizeof(char)); i > 0; i--) {
+					if (*(char*)((ULONG_PTR)pInstruction + i) == (char)DisplaceMent) {
+						Falied = false;
+						DispOffRet = i;
+						break;
+					}
+				}
+			}
+		}
+
+		if (pbFalied) {
+			*pbFalied = Falied;
+		}
+		return DispOffRet;
+	}
+	static size_t PlaceOffsetJump(void* pDestination, void* pTarget, void* pMemory)
+	{
+		bool IsLongJumpReq					= false;
+		int Displacement					= 0;
+		size_t JumpSize						= 0;
+
+		if (pDestination && pTarget && pMemory) {
+			Displacement = BuildInstructionTypeDisplaceMent(pDestination, pTarget, TOFFSET_GENERAL_JUMP, nullptr, nullptr, 0, &IsLongJumpReq, nullptr);
+			if (IsLongJumpReq) {
+				memcpy(pMemory, OffsetJumpLong, OFFSET_JUMP_LONG_HOOK_SIZE);
+				*(int*)((ULONG_PTR)pMemory + DISPLACEMENT_OFFSET) = Displacement;
+				JumpSize = OFFSET_JUMP_LONG_HOOK_SIZE;
+			}
+			else {
+				memcpy(pMemory, OffsetJumpShort, OFFSET_JUMP_SHORT_HOOK_SIZE);
+				*(char*)((ULONG_PTR)pMemory + DISPLACEMENT_OFFSET) = (char)Displacement;
+				JumpSize = OFFSET_JUMP_SHORT_HOOK_SIZE;
+			}
+		}
+		return JumpSize;
+	}
+	static size_t PlaceAbsJump(void* pDestination, void* pMemory)
+	{
+		size_t AbsJmpSize			= 0;
+
+		if (pDestination && pMemory) {
+			memcpy(pMemory, AbsJumpRaw, ABS_HOOK_SIZE);
+			*(void**)((ULONG_PTR)pMemory + ABS_JUMP_ADDRESS_OFFSET) = pDestination;
+			AbsJmpSize = ABS_HOOK_SIZE;
+
+			// different for 32 bit
+			if (!Is64BitProcess())
+				*(DWORD*)((ULONG_PTR)pMemory + sizeof(WORD)) = (DWORD)(((ULONG_PTR)pMemory + ABS_JUMP_ADDRESS_OFFSET));
+		}
+		return AbsJmpSize;
+	}
+	static WORD ConvertOpcode(void* pInstruction, InstructionType InsType, bool bToLong)
+	{
+		WORD Ret = 0;
+		if (pInstruction) {
+			if (InsType == TCONDITIONAL_GENERAL_JUMP) {
+				if (bToLong) {
+					*(BYTE*)(&Ret) = 0x0F;
+					// last 4 bits
+					*(BYTE*)((ULONG_PTR)&Ret + sizeof(BYTE)) = (0x80 | ((*(BYTE*)(pInstruction)) & 0x0F));
+				} else {
+					*(BYTE*)(&Ret) = (0x70 | ((*(BYTE*)((ULONG_PTR)pInstruction + sizeof(BYTE))) & 0x0F));
+				}
+			} else if (InsType == TOFFSET_GENERAL_JUMP) {
+				if (bToLong) {
+					*(BYTE*)(&Ret) = 0xE9;
+				} else {
+					*(BYTE*)(&Ret) = 0xEB;
+				}
+			}
+		}
+		return Ret;
+	}
+
+	static int BuildInstructionTypeDisplaceMent(void* pDestination, void* pTarget, InstructionType InsType, size_t* pNeededEncodeLength,
+		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFalied)
+	{
+		DisplacementVar RealDisplacement			= 0;
+		SIZE_T TSize								= 0;
+		
+		size_t NeededEncodeLength					= 0;
+		size_t DisplacementOffset					= 0;
+		int Flag									= EQUAL;
+
+		bool Falied									= false;
+		bool NotConfirmedInRange					= false;
+		bool InRange								= false;
+		bool LongJ									= false;
+
+		if (pDestination && pTarget) {
+			// check type
+			if ((ULONG_PTR)pDestination > (ULONG_PTR)pTarget) {
+				TSize = (SIZE_T)((ULONG_PTR)pDestination - (ULONG_PTR)pTarget);
+				NotConfirmedInRange = !(TSize > MAX_RANGE_DELTA_P);
+				Flag = POSITIVE;
+			} else if ((ULONG_PTR)pDestination < (ULONG_PTR)pTarget) {
+				TSize = (SIZE_T)((ULONG_PTR)pTarget - (ULONG_PTR)pDestination);
+				NotConfirmedInRange = !(TSize > MAX_RANGE_DELTA_P);
+				Flag = NEGATIVE;
+			} else {
+				NotConfirmedInRange = true;
+				Flag = EQUAL;
+			}
+
+			InRange = (Is64BitProcess() == true) ? NotConfirmedInRange : true;
+
+			if (InRange) {
+				// calculate new offset
+				RealDisplacement = (DisplacementVar)(((ULONG_PTR)pDestination - (ULONG_PTR)pTarget));
+
+				if (InsType == TSPECIAL__GENERAL_JUMP_C || InsType == TCONDITIONAL_GENERAL_JUMP || InsType == TOFFSET_GENERAL_JUMP) {
+					if (Flag == NEGATIVE) {
+						if (TSize > MAX_COND_SHORT_JUMP_OFFSET_N) {
+							if (InsType == TSPECIAL__GENERAL_JUMP_C)
+								Falied = true;
+							else
+								LongJ = true;
+						} else {
+							LongJ = false;
 						}
-						if ((ReturnAddress = VirtualAlloc((void*)* StartingBaseAddress, PageS, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) != NULL)
-							break;
-						if (!IsBack)
-							* StartingBaseAddress += 0x1000;
-						else
-							*StartingBaseAddress -= 0x1000;
-						Distance += 0x1000;
+					} 
+					else if (Flag == POSITIVE) {
+						if (TSize > MAX_COND_SHORT_JUMP_OFFSET_P) {
+							if (InsType == TSPECIAL__GENERAL_JUMP_C)
+								Falied = true;
+							else
+								LongJ = true;
+						} else {
+							LongJ = false;
+						}
+					} 
+					else {
+						LongJ = false;
 					}
-					if (OutErrorCode > NULL) {
-						*OutErrorCode = NULL;
+					if (!Falied) {
+						if (LongJ) {
+							if (InsType == TCONDITIONAL_GENERAL_JUMP) {
+								// for coditional jumps
+								RealDisplacement -= ABS_CALL_AND_COND_OFFSET_LONG_JUMP;
+								NeededEncodeLength = ABS_CALL_AND_COND_OFFSET_LONG_JUMP;
+								DisplacementOffset = sizeof(WORD);
+							} else {
+								// a non conditional jump
+								RealDisplacement -= OFFSET_JUMP_LONG_AND_OFFSET_CALL;
+								NeededEncodeLength = OFFSET_JUMP_LONG_AND_OFFSET_CALL;
+								DisplacementOffset = sizeof(BYTE);
+							}
+						} else {
+							RealDisplacement -= OFFSET_JUMP_COND_SHORT;
+							NeededEncodeLength = OFFSET_JUMP_COND_SHORT;
+							DisplacementOffset = sizeof(BYTE);
+						}
 					}
-					VirtualFree((void*)StartingBaseAddress, 0x1000, MEM_DECOMMIT);
-					return ReturnAddress;
+				} 
+				else if (InsType == TABSOLUTE_GENERAL_CALL || InsType == TABSOLUTE_GENERAL_JUMP) {
+					RealDisplacement -= ABS_CALL_AND_COND_OFFSET_LONG_JUMP;
+					NeededEncodeLength = ABS_CALL_AND_COND_OFFSET_LONG_JUMP;
+					DisplacementOffset = sizeof(WORD);
+				} 
+				else if (InsType == TOFFSET_GENERAL_CALL) {
+					RealDisplacement -= OFFSET_JUMP_LONG_AND_OFFSET_CALL;
+					NeededEncodeLength = OFFSET_JUMP_LONG_AND_OFFSET_CALL;
+					DisplacementOffset = sizeof(BYTE);
+				} 
+				else if (InsType == TABSOLUTE_GENERAL_JUMP_CUSTOM) {
+					RealDisplacement -= (ABS_CALL_AND_COND_OFFSET_LONG_JUMP + sizeof(BYTE));
+					NeededEncodeLength = (ABS_CALL_AND_COND_OFFSET_LONG_JUMP + sizeof(BYTE));
+					DisplacementOffset = (sizeof(BYTE) + sizeof(WORD));
+				} 
+				else {
+					RealDisplacement -= InsLength;
+					NeededEncodeLength = InsLength;
+					// I guess...
+					DisplacementOffset = 0;
 				}
-				else
-				{
-					if (OutErrorCode > NULL) {
-						*OutErrorCode = FALIED_ALLOCATION;
-					}
-				}
-				return NULL;
 			}
 			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = WARN_32_BIT;
+				Falied = true;
+		}
+		else
+			Falied = true;
+
+		if (pbFalied) {
+			*pbFalied = Falied;
+		}
+		if (pNeededEncodeLength) {
+			*pNeededEncodeLength = NeededEncodeLength;
+		}
+		if (pNewDisplaceMentOffset) {
+			*pNewDisplaceMentOffset = DisplacementOffset;
+		}
+		if (pbLongJump) {
+			*pbLongJump = LongJ;
+		}
+		return RealDisplacement;
+	}
+
+	static InstructionType GetInstructionTypeFromOffsetType(OffsetTypes OffType)
+	{
+		InstructionType Ret;
+		switch (OffType)
+		{
+		case TSPECIAL_JUMP_C:
+			Ret = TSPECIAL__GENERAL_JUMP_C;
+			break;
+		case TCONDITIONAL_LONG_JUMP:
+			Ret = TCONDITIONAL_GENERAL_JUMP;
+			break;
+		case TCONDITIONAL_SHORT_JUMP:
+			Ret = TCONDITIONAL_GENERAL_JUMP;
+			break;
+		case TOFFSET_SHORT_JUMP:
+			Ret = TOFFSET_GENERAL_JUMP;
+			break;
+		case TOFFSET_LONG_JUMP:
+			Ret = TOFFSET_GENERAL_JUMP;
+			break;
+		case TOFFSET_CALL:
+			Ret = TOFFSET_GENERAL_CALL;
+			break;
+		case TABSOLUTE_CALL:
+			Ret = TABSOLUTE_GENERAL_CALL;
+			break;
+		case TABSOLUTE_JUMP:
+			Ret = TABSOLUTE_GENERAL_JUMP;
+			break;
+		case TABSOLUTE_JUMP_CUSTOM:
+			Ret = TABSOLUTE_GENERAL_JUMP_CUSTOM;
+			break;
+		default:
+			Ret = T_GENERAL_UNKNOWN;
+			break;
+		}
+		return Ret;
+	}
+	static OffsetTypes GetInstructionOffType(void* pInstruction)
+	{
+		// check instructions
+		if (IsValidMem(pInstruction, false)) {
+			if (*(BYTE*)(pInstruction) == 0xE8) {
+				return TOFFSET_CALL;
+			}
+			if (*(BYTE*)(pInstruction) == 0xE9) {
+				return TOFFSET_LONG_JUMP;
+			}
+			if (*(BYTE*)(pInstruction) == 0xEB) {
+				return TOFFSET_SHORT_JUMP;
+			}
+
+			if (*(BYTE*)(pInstruction) >= 0x70 && *(BYTE*)(pInstruction) <= 0x7F) {
+				return TCONDITIONAL_SHORT_JUMP;
+			}
+			if (*(BYTE*)(pInstruction) == 0x0F) {
+				if (*(BYTE*)((ULONG_PTR)pInstruction + sizeof(BYTE)) >= 0x80 && *(BYTE*)((ULONG_PTR)pInstruction + sizeof(BYTE)) <= 0x8F)
+					return TCONDITIONAL_LONG_JUMP;
+			}
+
+			if (*(BYTE*)(pInstruction) == 0xE3 || *(BYTE*)(pInstruction) == 0xE2
+				|| *(BYTE*)(pInstruction) == 0xE1 || *(BYTE*)(pInstruction) == 0xE0) {
+				// not very much important, 2 bytes size.
+				return TSPECIAL_JUMP_C;
+			}
+
+			// absolute
+			if (*(WORD*)(pInstruction) == 0x15FF) {
+				return TABSOLUTE_CALL;
+			}
+			if (*(WORD*)(pInstruction) == 0x25FF) {
+				return TABSOLUTE_JUMP;
+			}
+			if (Is64BitProcess()) {
+				if (*(WORD*)((ULONG_PTR)pInstruction + sizeof(BYTE)) == 0x25FF)
+					return TABSOLUTE_JUMP_CUSTOM;
+			}
+		}
+		return TUNKNOWN;
+	}
+
+	static bool MustInstructionBeFixed(OffsetTypes Type, bool bLongDistance)
+	{
+		bool Ret;
+		switch (Type)
+		{
+		case TCONDITIONAL_LONG_JUMP:
+			Ret = (bLongDistance == false);
+			break;
+		case TCONDITIONAL_SHORT_JUMP:
+			Ret = bLongDistance;
+			break;
+		case TOFFSET_SHORT_JUMP:
+			Ret = bLongDistance;
+			break;
+		case TOFFSET_LONG_JUMP:
+			Ret = (bLongDistance == false);
+			break;
+		case TOFFSET_CALL:
+			Ret = false;
+			break;
+		case TABSOLUTE_CALL:
+			Ret = false;
+			break;
+		case TABSOLUTE_JUMP:
+			Ret = false;
+			break;
+		case TABSOLUTE_JUMP_CUSTOM:
+			Ret = false;
+			break;
+		default:
+			Ret = false;
+			break;
+		}
+		return Ret;
+	}
+	static bool IsValidMem(void* pMem, bool bWriteAccessNeeded)
+	{
+		bool bRet = false;
+		if (pMem) {
+			if (!bWriteAccessNeeded)
+				bRet = (IsBadReadPtr(pMem, sizeof(DWORD)) == FALSE);
+			else
+				bRet = (IsBadWritePtr(pMem, sizeof(DWORD)) == FALSE);
+		}
+		return bRet;
+	}
+	static bool EncodeDisplaceMentInstruction(void* pMemory, void* pOldOpCode, int offset, InstructionType InsType, bool bConvertOpcode,
+		bool IsLong, size_t EncodeSize, size_t DispOffset)
+	{
+		bool Continue				= false;
+		bool Falied					= false;
+		WORD CnvOpcode				= 0;
+
+		if (pMemory && EncodeSize && pOldOpCode) {
+			if (bConvertOpcode) {
+				// apparently the instruction was a (conditional) jump and it must be converted for a longer/smaller distance
+				CnvOpcode = ConvertOpcode(pOldOpCode, InsType, IsLong);
+				if (CnvOpcode) {
+					// copy the first converted bytes
+					memcpy(pMemory, &CnvOpcode, DispOffset);
+					Continue = true;
 				}
-				ReturnAddress = VirtualAlloc(NULL, PageS, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-				return ReturnAddress;
+				else
+					Falied = true;
+			}
+			else {
+				Continue = true;
+				memcpy(pMemory, pOldOpCode, DispOffset);
+			}
+
+			if (Continue) {
+				// install the displacement
+				memcpy((void*)((ULONG_PTR)pMemory + DispOffset), &offset, (EncodeSize - DispOffset));
 			}
 		}
 		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
+			Falied = true;
+		return (Falied != true);
+	}
+	static bool SearchAddressThroughSecs(void* ModBase, void* CurAddr, void** OutSBaseAddr, size_t* pSize)
+	{
+		bool bFound							= false;
+		void* OutSBaseAddrVar				= nullptr;
+		size_t Size							= 0;
+
+		if (CurAddr) {
+			IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)ModBase;
+			IMAGE_NT_HEADERS* pNt = (IMAGE_NT_HEADERS*)((ULONG_PTR)ModBase + pDos->e_lfanew);
+			IMAGE_SECTION_HEADER* pSec = IMAGE_FIRST_SECTION(pNt);
+
+			// Search through the sections
+			for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSec++) {
+				if (pSec->Characteristics & (0x00000020 | 0x20000000 | 0x40000000)) {
+					ULONG_PTR BaseAddr = (ULONG_PTR)ModBase + pSec->VirtualAddress;
+					ULONG_PTR EndAddr = (BaseAddr + pSec->SizeOfRawData);
+					if ((ULONG_PTR)CurAddr >= BaseAddr && (ULONG_PTR)CurAddr <= EndAddr) {
+						OutSBaseAddrVar = (void*)BaseAddr;
+						Size = pSec->SizeOfRawData;
+						bFound = true;
+						break;
+					}
+				}
 			}
 		}
-		return NULL;
-	}
 
-	// Custom 
-	static bool IsAddressRegisteredAsHook(void* Address)
+		if (OutSBaseAddr) {
+			*OutSBaseAddr = OutSBaseAddrVar;
+		}
+		if (pSize) {
+			*pSize = Size;
+		}
+		return bFound;
+	}
+	static bool IsValidHeader(void* CurrentBase)
 	{
-		auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-		while (IterS != ColdHook_Vars::RegisteredHooks.end())
-		{
-			if (IterS->second.HFunction == Address) {
-				return true;
+		// try to validate the module header ...
+		if (CurrentBase) {
+			if (IsValidMem(CurrentBase, false)) {
+				__try {
+					IMAGE_DOS_HEADER* pDosHeader = (IMAGE_DOS_HEADER*)CurrentBase;
+					if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+						return false;
+					}
+					IMAGE_NT_HEADERS* pNtHeader = (IMAGE_NT_HEADERS*)((ULONG_PTR)CurrentBase + pDosHeader->e_lfanew);
+					if (pNtHeader->Signature != IMAGE_NT_SIGNATURE) {
+						return false;
+					}
+					if (pNtHeader->FileHeader.Machine != VALID_MACHINE) {
+						return false;
+					}
+					return true;
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) {
+					return false;
+				}
 			}
-			IterS++;
 		}
 		return false;
 	}
-
-	
-	// Function wrap hooks
-	static BYTE HookDataB[0x100] = { 0 };
-	int32_t InitFunctionHookByName(Hook_Info* OutputInfo, bool WrapFunction, bool CheckKBase, const char* ModulName, const char* FName, void* HookedF, int32_t* OutErrorCode)
+	static bool IsHookAlreadyRegistered(int32_t HookID)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
-
-		if (OutputInfo > NULL && FName > NULL && HookedF > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				FARPROC RequestedFAddress = NULL;
-				HMODULE RequestedM = NULL;
-
-				ULONG_PTR TNextInstruction = NULL;
-				SIZE_T TrampolineISize = NULL;
-				SIZE_T MaxHSize = 5;
-				DWORD OldP = NULL;
-				int32_t Code = NULL;
-
-				bool BytesStored = false;
-				bool Assembled = false;
-
-				void* Redirection = NULL;
-				void* JumpTo = NULL;
-
-				std::memset(HookDataB, 0, sizeof(HookDataB));
-
-				// Read module
-				RequestedM = GetModuleHandleA(ModulName);
-				
-				if (RequestedM > NULL)
-				{
-					// Get function pointer 
-					RequestedFAddress = GetProcAddress(RequestedM, FName);
-
-					// Latest windows uses mostly the kernel32 dll as a "bridge" to jump to the reals functions in the kernelbase module.
-					if (ModulName > NULL) {
-						if (CheckKBase && ColdHook_Service::Is64BitProcess()) {
-							HMODULE hKernelBase = GetModuleHandleA("kernelbase.dll");
-							HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-							FARPROC RequestedKbaseF = GetProcAddress(hKernelBase, FName);
-							if (RequestedM == hKernel32) {
-								if (hKernelBase > NULL && RequestedKbaseF > NULL) {
-									// if the first 8 bytes are same, we continue using the requested module name
-									if (std::memcmp((void*)RequestedFAddress, (void*)RequestedKbaseF, 8) != 0) {
-										RequestedM = hKernelBase;
-										RequestedFAddress = RequestedKbaseF;
-									}
-								}
-							}
-						}
-					}
-
-					if (RequestedFAddress > NULL)
-					{
-						if (!ColdHook_Service::IsAddressRegisteredAsHook((void*)RequestedFAddress))
-						{
-							SIZE_T ChangedHookSize = NULL;
-							unsigned char* Encode;
-
-							Redirection = ColdHook_Service::AllocateTrampoline((ULONG_PTR)RequestedM, 0x1000, &Code, &ChangedHookSize);
-							if (ChangedHookSize != NULL) {
-								MaxHSize = ChangedHookSize;
-							}
-							if (WrapFunction)
-							{
-								if (Redirection > NULL)
-								{
-									if (Code == NULL) // If 64 bit hook
-									{
-										unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, 
-											&TNextInstruction, MaxHSize, (ULONG_PTR)RequestedFAddress,
-											(void*)RequestedFAddress, 
-											(void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*)));
-
-										if (DecodedI != NULL)
-										{
-											// Install jump to our hooked function.
-											*(BYTE*)Redirection = 0xFF;
-											*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE)) = 0x25;
-											std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-											*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = HookedF;
-
-											// Apply the return back jump
-											*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize) = 0xFF;
-											*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE)) = 0x25;
-											std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-											*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = (void*)TNextInstruction;
-
-											JumpTo = Redirection;
-											Redirection = (void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*));
-										}
-										else
-										{
-											if (OutErrorCode > NULL) {
-												*OutErrorCode = FALIED_DISASSEMBLER;
-											}
-											ColdHook_Vars::Thread.unlock();
-											return NULL;
-										}
-									}
-									else if (Code == FALIED_OUT_RANGE)
-									{
-										unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, &TNextInstruction, MaxHSize, (ULONG_PTR)RequestedFAddress,
-											(void*)RequestedFAddress, Redirection);
-
-										if (DecodedI != NULL)
-										{
-											*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize) = 0xFF;
-											*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE)) = 0x25;
-											std::memset((void*)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-											*(void**)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = (void*)TNextInstruction;
-											JumpTo = HookedF;
-
-											// Hook bytes
-											HookDataB[0] = 0xFF;
-											HookDataB[1] = 0x25;
-											std::memset(&HookDataB[2], NULL, sizeof(DWORD));
-											std::memcpy(&HookDataB[6], &JumpTo, sizeof(void*));
-											BytesStored = true;
-										}
-										else
-										{
-											if (OutErrorCode > NULL) {
-												*OutErrorCode = FALIED_DISASSEMBLER;
-											}
-											ColdHook_Vars::Thread.unlock();
-											return NULL;
-										}
-									}
-									else if (Code == WARN_32_BIT)	// 32 bit
-									{
-										unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, &TNextInstruction, MaxHSize, (ULONG_PTR)RequestedFAddress,
-											(void*)RequestedFAddress, Redirection);
-
-										if (DecodedI != NULL)
-										{
-											// Apply the return back jump
-											*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize) = 0xE9;
-											ULONG_PTR TempVar = (ULONG_PTR)Redirection + TrampolineISize;
-											SIZE_T Jumpoffset = (ULONG_PTR)TNextInstruction - TempVar - MaxHSize;
-											std::memcpy((void*)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE)), &Jumpoffset, sizeof(DWORD));
-
-											JumpTo = HookedF;
-										}
-										else
-										{
-											if (OutErrorCode > NULL) {
-												*OutErrorCode = FALIED_DISASSEMBLER;
-											}
-											ColdHook_Vars::Thread.unlock();
-											return NULL;
-										}
-									}
-									else
-									{
-										if (OutErrorCode > NULL) {
-											*OutErrorCode = FALIED_ALLOCATION;
-										}
-										ColdHook_Vars::Thread.unlock();
-										return NULL;
-									}
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_ALLOCATION;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return NULL;
-								}
-							}
-							else
-							{
-								if (Redirection > NULL)
-								{
-									if (Code == NULL) // If 64 bit hook
-									{
-										// Install jump to our hooked function.
-										*(BYTE*)Redirection = 0xFF;
-										*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE)) = 0x25;
-										std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-										*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = HookedF;
-
-										JumpTo = Redirection;
-										Redirection = (void*)RequestedFAddress;
-									}
-									else if (Code == WARN_32_BIT)
-									{
-										VirtualFree(Redirection, NULL, MEM_RELEASE);
-										JumpTo = HookedF;
-										Redirection = (void*)RequestedFAddress;
-									}
-									else if (Code == FALIED_OUT_RANGE)
-									{
-										JumpTo = HookedF;
-										Redirection = (void*)RequestedFAddress;
-
-										// Hook bytes
-										HookDataB[0] = 0xFF;
-										HookDataB[1] = 0x25;
-										std::memset(&HookDataB[2], NULL, sizeof(DWORD));
-										std::memcpy(&HookDataB[6], &JumpTo, sizeof(void*));
-										BytesStored = true;
-									}
-									else
-									{
-										if (OutErrorCode > NULL) {
-											*OutErrorCode = FALIED_ALLOCATION;
-										}
-										ColdHook_Vars::Thread.unlock();
-										return NULL;
-									}
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_ALLOCATION;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return NULL;
-								}
-							}
-							// Setup our hook
-							if (VirtualProtect((void*)RequestedFAddress, MaxHSize, PAGE_EXECUTE_READWRITE, &OldP))
-							{
-								// Original bytes 
-								OutputInfo->OrgData = VirtualAlloc(NULL, MaxHSize + 1, MEM_COMMIT, PAGE_READWRITE);
-								OutputInfo->HookData = VirtualAlloc(NULL, MaxHSize + 1, MEM_COMMIT, PAGE_READWRITE);
-
-								if (OutputInfo->OrgData > NULL && OutputInfo->HookData > NULL)
-								{
-									if (!BytesStored) {
-										// Set hook bytes
-										HookDataB[0] = 0xE9;
-										SIZE_T Jumpoffset = (ULONG_PTR)JumpTo - (ULONG_PTR)RequestedFAddress - MaxHSize;
-										std::memcpy(&HookDataB[1], &Jumpoffset, sizeof(DWORD));
-									}
-									std::memcpy(OutputInfo->OrgData, (void*)RequestedFAddress, MaxHSize);
-									std::memcpy((void*)RequestedFAddress, HookDataB, MaxHSize);
-									std::memcpy(OutputInfo->HookData, HookDataB, MaxHSize);
-
-									VirtualProtect((void*)RequestedFAddress, MaxHSize, OldP, &OldP);
-
-									if (ModulName > NULL)
-										OutputInfo->ModuleName = ModulName;
-									else
-										OutputInfo->ModuleName = "";
-
-									OutputInfo->FunctionName = FName;
-
-									OutputInfo->HFunction = (void*)RequestedFAddress;
-									OutputInfo->HookSize = MaxHSize;
-
-									OutputInfo->OriginalF = Redirection;
-									OutputInfo->TrampolinePage = JumpTo;
-
-									OutputInfo->TrampolineSize = 0x1000;
-
-									if (Code == WARN_32_BIT && WrapFunction != true)
-										OutputInfo->Trampoline = false;
-									else
-										OutputInfo->Trampoline = true;
-
-									OutputInfo->StatusHooked = true;
-
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = NULL;
-									}
-
-									ColdHook_Vars::CurrentID++;
-									ColdHook_Vars::Thread.unlock();
-
-									return ColdHook_Vars::CurrentID;
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_ALLOCATION;
-									}
-								}
-							}
-							else
-							{
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_MEM_PROTECTION;
-								}
-							}
-						}
-						else
-						{
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALREADY_EXISTS;
-							}
-						}
-					}
-					else
-					{
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = FALIED_FUNCTION_NOT_FOUND;
-						}
-					}
-				}
-				else
-				{
-					if (OutErrorCode > NULL) {
-						*OutErrorCode = FALIED_MODULE_NOT_FOUND;
-					}
-				}
-			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
-			}
+		bool bRet = false;
+		if (!ColdHook_Vars::RegisteredHooks.empty()) {
+			auto pos = ColdHook_Vars::RegisteredHooks.find(HookID);
+			bRet = (pos != ColdHook_Vars::RegisteredHooks.end());
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
-		}
-		ColdHook_Vars::Thread.unlock();
-		return NULL;
-	}
-	int32_t InitFunctionHookByAddress(Hook_Info* OutputInfo, bool WrapFunction, void* Target, void* HookedF, int32_t* OutErrorCode)
-	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
-
-		if (OutputInfo > NULL && Target > NULL && HookedF > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				ULONG_PTR TNextInstruction = NULL;
-				SIZE_T TrampolineISize = NULL;
-				SIZE_T MaxHSize = 5;
-				DWORD OldP = NULL;
-				int32_t Code = NULL;
-
-				bool BytesStored = false;
-
-				void* Redirection = NULL;
-				void* JumpTo = NULL;
-
-				std::memset(HookDataB, 0, sizeof(HookDataB));
-
-				if (!ColdHook_Service::IsAddressRegisteredAsHook(Target))
-				{
-					SIZE_T ChangedHookSize = NULL;
-
-					Redirection = ColdHook_Service::AllocateTrampoline((ULONG_PTR)Target, 0x1000, &Code, &ChangedHookSize);
-					if (ChangedHookSize != NULL) {
-						MaxHSize = ChangedHookSize;
-					}
-					if (WrapFunction)
-					{
-						if (Redirection > NULL)
-						{
-							if (Code == NULL) // If 64 bit hook
-							{
-								unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, &TNextInstruction, MaxHSize, (ULONG_PTR)Target,
-									Target, (void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*)));
-
-								if (DecodedI != NULL)
-								{
-									// Install jump to our hooked function.
-									*(BYTE*)Redirection = 0xFF;
-									*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE)) = 0x25;
-									std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-									*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = HookedF;
-
-									// Apply the return back jump
-									*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize) = 0xFF;
-									*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE)) = 0x25;
-									std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-									*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*) + TrampolineISize + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = (void*)TNextInstruction;
-
-									JumpTo = Redirection;
-									Redirection = (void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD) + sizeof(void*));
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_DISASSEMBLER;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return NULL;
-								}
-							}
-							else if (Code == FALIED_OUT_RANGE)
-							{
-								unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, &TNextInstruction, MaxHSize, (ULONG_PTR)Target,
-									Target, Redirection);
-								if (DecodedI != NULL)
-								{
-									*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize) = 0xFF;
-									*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE)) = 0x25;
-									std::memset((void*)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-									*(void**)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = (void*)TNextInstruction;
-									JumpTo = HookedF;
-
-									// Hook bytes
-									HookDataB[0] = 0xFF;
-									HookDataB[1] = 0x25;
-									std::memset(&HookDataB[2], NULL, sizeof(DWORD));
-									std::memcpy(&HookDataB[6], &JumpTo, sizeof(void*));
-									BytesStored = true;
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_DISASSEMBLER;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return NULL;
-								}
-							}
-							else if (Code == WARN_32_BIT)	// 32 bit
-							{
-								unsigned int DecodedI = ColdHook_Service::DisasmRange(&TrampolineISize, &TNextInstruction, MaxHSize, (ULONG_PTR)Target,
-									Target, Redirection);
-								if (DecodedI != NULL)
-								{
-									// Apply the return back jump
-									*((BYTE*)(ULONG_PTR)Redirection + TrampolineISize) = 0xE9;
-									ULONG_PTR TempVar = (ULONG_PTR)Redirection + TrampolineISize;
-									SIZE_T Jumpoffset = (ULONG_PTR)TNextInstruction - TempVar - MaxHSize;
-									std::memcpy((void*)((ULONG_PTR)Redirection + TrampolineISize + sizeof(BYTE)), &Jumpoffset, sizeof(DWORD));
-
-									JumpTo = HookedF;
-								}
-								else
-								{
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = FALIED_DISASSEMBLER;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return NULL;
-								}
-							}
-							else
-							{
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_ALLOCATION;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return NULL;
-							}
-						}
-						else
-						{
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALLOCATION;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return NULL;
-						}
-					}
-					else
-					{
-						if (Redirection > NULL)
-						{
-							if (Code == NULL) // If 64 bit hook
-							{
-								// Install jump to our hooked function.
-								*(BYTE*)Redirection = 0xFF;
-								*((BYTE*)(ULONG_PTR)Redirection + sizeof(BYTE)) = 0x25;
-								std::memset((void*)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE)), NULL, sizeof(DWORD));
-
-								*(void**)((ULONG_PTR)Redirection + sizeof(BYTE) + sizeof(BYTE) + sizeof(DWORD)) = HookedF;
-
-								JumpTo = Redirection;
-								Redirection = Target;
-							}
-							else if (Code == FALIED_OUT_RANGE)
-							{
-								JumpTo = HookedF;
-								Redirection = Target;
-
-								// Hook bytes
-								HookDataB[0] = 0xFF;
-								HookDataB[1] = 0x25;
-								std::memset(&HookDataB[2], NULL, sizeof(DWORD));
-								std::memcpy(&HookDataB[6], &JumpTo, sizeof(void*));
-								BytesStored = true;
-							}
-							else if (Code == WARN_32_BIT) // 32 bit
-							{
-								VirtualFree(Redirection, NULL, MEM_RELEASE);
-								JumpTo = HookedF;
-								Redirection = Target;
-							}
-							else
-							{
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_ALLOCATION;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return NULL;
-							}
-						}
-						else
-						{
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALLOCATION;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return NULL;
-						}
-					}
-					// Setup our hook
-					if (VirtualProtect(Target, MaxHSize, PAGE_EXECUTE_READWRITE, &OldP))
-					{
-						// Original bytes 
-						OutputInfo->OrgData = VirtualAlloc(NULL, MaxHSize + 1, MEM_COMMIT, PAGE_READWRITE);
-						OutputInfo->HookData = VirtualAlloc(NULL, MaxHSize + 1, MEM_COMMIT, PAGE_READWRITE);
-
-						if (OutputInfo->OrgData > NULL && OutputInfo->HookData > NULL)
-						{
-							std::memcpy(OutputInfo->OrgData, Target, MaxHSize);
-
-							if (!BytesStored) {
-								// Set hook bytes
-								HookDataB[0] = 0xE9;								
-								SIZE_T Jumpoffset = (ULONG_PTR)JumpTo - (ULONG_PTR)Target - MaxHSize;
-								std::memcpy(&HookDataB[1], &Jumpoffset, sizeof(DWORD));
-							}
-							std::memcpy(OutputInfo->OrgData, Target, MaxHSize);
-							std::memcpy(Target, HookDataB, MaxHSize);
-							std::memcpy(OutputInfo->HookData, HookDataB, MaxHSize);
-							
-							VirtualProtect(Target, MaxHSize, OldP, &OldP);
-
-							OutputInfo->FunctionName = "";
-							OutputInfo->ModuleName = "";
-
-							OutputInfo->HFunction = Target;
-							OutputInfo->HookSize = MaxHSize;
-
-							OutputInfo->OriginalF = Redirection;
-							OutputInfo->TrampolinePage = JumpTo;
-
-							OutputInfo->TrampolineSize = 0x1000;
-
-							if (Code == WARN_32_BIT && WrapFunction != true)
-								OutputInfo->Trampoline = false;
-							else
-								OutputInfo->Trampoline = true;
-
-							OutputInfo->StatusHooked = true;
-
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = NULL;
-							}
-
-							ColdHook_Vars::CurrentID++;
-							ColdHook_Vars::Thread.unlock();
-
-							return ColdHook_Vars::CurrentID;
-						}
-						else
-						{
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALLOCATION;
-							}
-						}
-					}
-					else
-					{
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = FALIED_MEM_PROTECTION;
-						}
-					}
-				}
-				else
-				{
-					if (OutErrorCode > NULL) {
-						*OutErrorCode = FALIED_ALREADY_EXISTS;
-					}
-				}
-			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
-			}
-		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
-		}
-		ColdHook_Vars::Thread.unlock();
-		return NULL;
+		return bRet;
 	}
 
-
-	// Memory custom hook
-	int32_t InitHookCustomData(Hook_Info* OutputInfo, void* Target, void* CustomData, size_t CSize, int32_t* OutErrorCode)
+	static void LockOrUnlockOtherThreads(bool bLock)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		if (bLock)
+			ColdHook_Vars::Thread.lock();
+		else
+			ColdHook_Vars::Thread.unlock();
+	}
 
-		if (OutputInfo > NULL && Target > NULL && CustomData > NULL)
+	static void InternalUnHookRegData(bool ShutDown, Hook_Info* pData, int32_t* OutErrorCode)
+	{
+		int32_t ErrorC				= 0;
+		DWORD TmpP					= 0;
+
+		if (pData)
 		{
-			if (ColdHook_Vars::Inited)
+			if (pData->StatusHooked)
 			{
-				if (!ColdHook_Service::IsAddressRegisteredAsHook(Target))
+				if (VirtualProtect(pData->HFunction, pData->HookSize, PAGE_EXECUTE_READWRITE, &TmpP))
 				{
-					DWORD OldP = NULL;
-					if (VirtualProtect(Target, CSize, PAGE_EXECUTE_READWRITE, &OldP))
+					if (pData->IsDetourHook)
 					{
-						OutputInfo->OrgData = VirtualAlloc(NULL, CSize + 1, MEM_COMMIT, PAGE_READWRITE);
-						OutputInfo->HookData = VirtualAlloc(NULL, CSize + 1, MEM_COMMIT, PAGE_READWRITE);
-
-						if (OutputInfo->OrgData > NULL && OutputInfo->HookData > NULL)
+						memcpy(pData->HFunction, pData->OrgData, pData->HookSize);
+						if (pData->TrampolineAllocated)
 						{
-							std::memcpy(OutputInfo->OrgData, Target, CSize);
-							std::memcpy(OutputInfo->HookData, CustomData, CSize);
+							if (ShutDown)
+							{
+								VirtualFree(pData->TrampolinePage, 0, MEM_RELEASE);
 
-							std::memcpy(Target, CustomData, CSize);
-							VirtualProtect(Target, CSize, OldP, &OldP);
-
-							OutputInfo->FunctionName = "";
-							OutputInfo->ModuleName = "";
-
-							OutputInfo->HFunction = Target;
-							OutputInfo->HookSize = CSize;
-
-							OutputInfo->OriginalF = NULL;
-							OutputInfo->TrampolinePage = NULL;
-							OutputInfo->TrampolineSize = NULL;
-
-							OutputInfo->Trampoline = false;
-							OutputInfo->StatusHooked = true;
-
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = NULL;
+								pData->TrampolinePage = nullptr;
+								pData->TrampolineAllocated = false;
 							}
-
-							ColdHook_Vars::CurrentID++;
-							ColdHook_Vars::Thread.unlock();
-
-							return ColdHook_Vars::CurrentID;
 						}
 						else
 						{
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALLOCATION;
+							if (pData->TrampolinePage) 
+							{
+								// code cave...
+								if (VirtualProtect(pData->TrampolinePage, MAX_CAVE_DATA, PAGE_EXECUTE_READWRITE, &TmpP)) 
+								{
+									BYTE* pPos = (BYTE*)pData->TrampolinePage;
+									for (size_t i = 0; i < MAX_CAVE_DATA; i++) 
+									{
+										pPos[i] = pData->CodeCaveOData;
+									}
+									VirtualProtect(pData->TrampolinePage, MAX_CAVE_DATA, pData->CaveOriginalProtection, &TmpP);
+								}
 							}
 						}
 					}
-					else
+					else 
 					{
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = FALIED_MEM_PROTECTION;
+						memcpy(pData->HFunction, pData->COrgData, pData->HookSize);
+						if (ShutDown) 
+						{
+							free(pData->COrgData);
+							free(pData->CHookData);
+
+							pData->COrgData = nullptr;
+							pData->CHookData = nullptr;
 						}
 					}
+					VirtualProtect(pData->HFunction, pData->HookSize, TmpP, &TmpP);
+					pData->StatusHooked = false;
 				}
 				else 
 				{
-					if (OutErrorCode > NULL) {
-						*OutErrorCode = FALIED_ALREADY_EXISTS;
+					ErrorC = FALIED_MEM_PROTECTION;
+				}
+			} 
+			else
+			{
+				ErrorC = FALIED_HOOK_NOT_EXISTS;
+			}
+		}
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+	}
+	static void InternalHookRegData(Hook_Info* pData, int32_t* OutErrorCode)
+	{
+		int32_t ErrorC				= 0;
+		DWORD TmpP					= 0;
+
+		if (pData)
+		{
+			if (!pData->StatusHooked)
+			{
+				if (VirtualProtect(pData->HFunction, pData->HookSize, PAGE_EXECUTE_READWRITE, &TmpP))
+				{
+					if (pData->IsDetourHook)
+					{
+						if (!pData->TrampolineAllocated)
+						{
+							if (pData->TrampolinePage)
+							{
+								if (VirtualProtect(pData->TrampolinePage, MAX_CAVE_DATA, PAGE_EXECUTE_READWRITE, &TmpP))
+								{
+									memcpy(pData->TrampolinePage, pData->CaveHookData, MAX_CAVE_DATA);
+									memcpy(pData->HFunction, pData->HookData, pData->HookSize);
+									VirtualProtect(pData->TrampolinePage, MAX_CAVE_DATA, pData->CaveOriginalProtection, &TmpP);
+
+									pData->StatusHooked = true;
+								}
+								else
+								{
+									ErrorC = FALIED_MEM_PROTECTION;
+									pData->StatusHooked = false;
+								}
+							}
+							else
+							{
+								memcpy(pData->HFunction, pData->HookData, pData->HookSize);
+								pData->StatusHooked = true;
+							}
+						}
+						else
+						{
+							memcpy(pData->HFunction, pData->HookData, pData->HookSize);
+							pData->StatusHooked = true;
+						}
 					}
+					else
+					{
+						memcpy(pData->HFunction, pData->COrgData, pData->HookSize);
+						pData->StatusHooked = true;
+					}
+					VirtualProtect(pData->HFunction, pData->HookSize, TmpP, &TmpP);
+				}
+				else
+				{
+					ErrorC = FALIED_MEM_PROTECTION;
 				}
 			}
 			else
 			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
+				ErrorC = FALIED_HOOK_EXISTS;
+			}
+		}
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+	}
+	static Hook_Info* InternalInitializeSTR(bool bDetourHook)
+	{
+		Hook_Info* OutputInfo			= nullptr;
+
+		OutputInfo = (Hook_Info*)malloc(sizeof(Hook_Info));
+		if (OutputInfo) {
+			// initialize structure 
+			memset(OutputInfo->OrgData, 0, MAX_HOOK_ARRAY);
+			memset(OutputInfo->HookData, 0, MAX_HOOK_ARRAY);
+			memset(OutputInfo->CaveHookData, 0, MAX_CAVE_DATA);
+
+			OutputInfo->StatusHooked = false;
+			OutputInfo->TrampolineAllocated = false;
+			OutputInfo->IsDetourHook = bDetourHook;
+			OutputInfo->OriginalF = nullptr;
+			OutputInfo->HFunction = nullptr;
+			OutputInfo->TrampolinePage = nullptr;
+			OutputInfo->CHookData = nullptr;
+			OutputInfo->COrgData = nullptr;
+			OutputInfo->HookSize = 0;
+			OutputInfo->CaveOriginalProtection = 0;
+			OutputInfo->CodeCaveOData = 0;
+		}
+		return OutputInfo;
+	}
+	static void InternalEmuHook(void* pPlace, void* pDFunction, Hook_Info* OutputInfo, int32_t* pOutErrorCode)
+	{
+		int32_t ErrorCode = 0;
+		if (IsValidMem(pPlace, false) && IsValidMem(pDFunction, false)) {
+			if (Is64BitProcess()) {
+				OutputInfo->HookSize = PlaceAbsJump(pDFunction, OutputInfo->HookData);
+			} else {
+				OutputInfo->HookSize = PlaceOffsetJump(pDFunction, pPlace, OutputInfo->HookData);
 			}
 		}
 		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+			ErrorCode = FALIED_MEM_PROTECTION;
+
+		if (pOutErrorCode) {
+			*pOutErrorCode = ErrorCode;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return NULL;
+	}
+	static void* InternalDetourHook(void* pPlace, void* pDFunction, Hook_Info* OutputInfo, int32_t* pOutErrorCode)
+	{
+		// special hook type to allow to call the original function back.
+		void* BeckupF						= pPlace;
+		void* CurFunction					= BeckupF;
+		void* HookedF						= pDFunction;
+		void* pTrampInstructionStart		= nullptr;
+		void* pReturnFunction				= nullptr;
+		void* pTrampInstructionEnd			= nullptr;
+		void* pRedirStart					= nullptr;
+		void* pReturnCode					= nullptr;
+		void* Trampoline					= nullptr;
+
+		size_t DisassembledLength			= 0;
+		size_t VarHookSize					= 0;
+
+		bool bPatchRedirAddress				= false;
+		bool bAbsReturnJump					= false;
+		bool HOffsetJump					= true;
+		bool IsLongJumpReq					= false;
+		bool IsCodeCave						= false;
+
+		int TrampolineResponse				= 0;
+		int32_t ErrorCode					= 0;
+		DWORD OldCaveP						= 0;
+
+		if (IsValidMem(CurFunction, false) && IsValidMem(HookedF, false))
+		{
+			CurFunction = WalkThroughJumpIfPossible(BeckupF);
+			if (CurFunction == nullptr)
+				CurFunction = BeckupF;
+
+			Trampoline = FindTrampoline(CurFunction, MAX_CAVE_DATA, true, &TrampolineResponse, &OldCaveP);
+			if (Trampoline)
+			{
+				switch (TrampolineResponse)
+				{
+				case ALLOCATED_64_2GB_CLOSE:
+					pTrampInstructionStart = (void*)((ULONG_PTR)Trampoline + ABS_64_HOOK_SIZE);
+					pRedirStart = Trampoline;
+					HOffsetJump = true;
+					bAbsReturnJump = true;
+					bPatchRedirAddress = true;
+					IsCodeCave = false;
+
+					OutputInfo->TrampolineAllocated = true;
+					OutputInfo->TrampolinePage = Trampoline;
+					OutputInfo->CaveOriginalProtection = OldCaveP;
+					OutputInfo->CodeCaveOData = 0;
+					break;
+				case RANDOM_ALLOCATED_32:
+					pTrampInstructionStart = Trampoline;
+					pRedirStart = HookedF;
+					HOffsetJump = true;
+					bAbsReturnJump = false;
+					bPatchRedirAddress = false;
+					IsCodeCave = false;
+
+					OutputInfo->TrampolineAllocated = true;
+					OutputInfo->TrampolinePage = Trampoline;
+					OutputInfo->CaveOriginalProtection = OldCaveP;
+					OutputInfo->CodeCaveOData = 0;
+					break;
+				case RANDOM_ALLOCATED_64:
+					pTrampInstructionStart = Trampoline;
+					pRedirStart = HookedF;
+					HOffsetJump = false;
+					bAbsReturnJump = true;
+					bPatchRedirAddress = false;
+					IsCodeCave = false;
+
+					OutputInfo->TrampolineAllocated = true;
+					OutputInfo->TrampolinePage = Trampoline;
+					OutputInfo->CaveOriginalProtection = OldCaveP;
+					OutputInfo->CodeCaveOData = 0;
+					break;
+				default:
+					// code cave
+					if (Is64BitProcess()) {
+						pTrampInstructionStart = (void*)((ULONG_PTR)Trampoline + ABS_64_HOOK_SIZE);
+						pRedirStart = Trampoline;
+						HOffsetJump = true;
+						bAbsReturnJump = false;
+						bPatchRedirAddress = true;
+						IsCodeCave = true;
+					}
+					else {
+						pTrampInstructionStart = Trampoline;
+						pRedirStart = HookedF;
+						HOffsetJump = true;
+						bAbsReturnJump = false;
+						bPatchRedirAddress = false;
+						IsCodeCave = true;
+					} 
+
+					OutputInfo->TrampolineAllocated = false;
+					OutputInfo->TrampolinePage = Trampoline;
+					OutputInfo->CaveOriginalProtection = OldCaveP;
+					OutputInfo->CodeCaveOData = *(BYTE*)(Trampoline);
+					break;
+				}
+
+				// prepare hook data
+				if (!HOffsetJump) {
+					VarHookSize = PlaceAbsJump(pRedirStart, OutputInfo->HookData);
+				}
+				else {
+					VarHookSize = PlaceOffsetJump(pRedirStart, CurFunction, OutputInfo->HookData);
+				}
+
+				// final hook size
+				pReturnFunction = pTrampInstructionStart;
+				OutputInfo->HookSize = VarHookSize;
+				OutputInfo->OriginalF = pReturnFunction;
+
+				// disassemble and copy the instruction
+				pReturnCode = BeckupOriginalInstructions(CurFunction, pTrampInstructionStart, VarHookSize, &DisassembledLength);
+				if (pReturnCode) {
+					pTrampInstructionEnd = (void*)((ULONG_PTR)pTrampInstructionStart + DisassembledLength);
+
+					// trampoline setup 
+					if (bPatchRedirAddress) {
+						PlaceAbsJump(HookedF, pRedirStart);
+					}
+
+					if (bAbsReturnJump) {
+						PlaceAbsJump(pReturnCode, pTrampInstructionEnd);
+					}
+					else {
+						PlaceOffsetJump(pReturnCode, pTrampInstructionEnd, pTrampInstructionEnd);
+					}
+
+					if (IsCodeCave) {
+						memcpy(OutputInfo->CaveHookData, Trampoline, MAX_CAVE_DATA);
+					}
+				}
+				else
+					ErrorCode = FALIED_DISASSEMBLER;
+			}
+			else
+				ErrorCode = FALIED_TRAMPOLINE_NOT_FOUND;
+		}
+		else
+			ErrorCode = FALIED_MEM_PROTECTION;
+
+		if (pOutErrorCode) {
+			*pOutErrorCode = ErrorCode;
+		}
+		return CurFunction;
+	}
+
+	// Function wrap hooks
+	int32_t InitFunctionHookByName(Hook_Info** OutputInfo, bool WrapFunction, bool CheckKBase, const char* ModulName, const char* FName, void* HookedF, int32_t* OutErrorCode)
+	{
+		// Vars
+		void* CurFunction						= nullptr;
+		const char* ModuleN						= ModulName;
+
+		int32_t ErrorC							= 0;
+		int32_t Ret								= 0;
+
+		// Check arguments
+		if (ModuleN && FName) {
+			// Check if we can use the kernel base module 
+			if (CheckKBase) {
+				if (strlen("kernel32.dll") == strlen(ModuleN)) {
+					if (strcmp(ModuleN, "kernel32.dll") == 0) {
+						ModuleN = "kernelbase.dll";
+					}
+				}
+			}
+			// Get function pointer
+			CurFunction = GetProcAddress(GetModuleHandleA(ModuleN), FName);
+			Ret = InitFunctionHookByAddress(OutputInfo, WrapFunction, CurFunction, HookedF, &ErrorC);
+
+		} else {
+			ErrorC = FALIED_INVALID_PARAMETER;
+		}
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return Ret;
+	}
+	int32_t InitFunctionHookByAddress(Hook_Info** OutputInfo, bool WrapFunction, void* Target, void* HookedF, int32_t* OutErrorCode)
+	{
+		// Vars
+		void* CurFunction						= Target;
+		Hook_Info* OutputInfoVar				= nullptr;
+		Hook_Info* OutputRet					= nullptr;
+
+		int32_t ErrorC							= 0;
+		int32_t Ret								= 0;
+
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		// arguments 
+		if (OutputInfo && CurFunction && HookedF) {
+			// check system initialization
+			if (ColdHook_Vars::Inited) {
+				OutputInfoVar = InternalInitializeSTR(true);
+
+				if (OutputInfoVar) {
+					if (!WrapFunction) {
+						InternalEmuHook(CurFunction, HookedF, OutputInfoVar, &ErrorC);
+					}
+					else {
+						CurFunction = InternalDetourHook(CurFunction, HookedF, OutputInfoVar, &ErrorC);
+					}
+
+					if (!ErrorC) {
+						// Hook
+						DWORD OLDP;
+						if (VirtualProtect(CurFunction, OutputInfoVar->HookSize, PAGE_EXECUTE_READWRITE, &OLDP)) {
+							// Store original data
+							memcpy(OutputInfoVar->OrgData, CurFunction, OutputInfoVar->HookSize);
+
+							// Place hook
+							memcpy(CurFunction, OutputInfoVar->HookData, OutputInfoVar->HookSize);
+
+							OutputInfoVar->StatusHooked = true;
+							OutputInfoVar->HFunction = CurFunction;
+
+							// restore protection 
+							VirtualProtect(CurFunction, OutputInfoVar->HookSize, OLDP, &OLDP);
+
+							OutputRet = OutputInfoVar;
+							++ColdHook_Vars::CurrentID;
+							Ret = ColdHook_Vars::CurrentID;
+						}
+						else {
+							ErrorC = FALIED_MEM_PROTECTION;
+						}
+					}
+				}
+				else {
+					ErrorC = FALIED_ALLOCATION;
+				}
+			}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
+			}
+			*OutputInfo = OutputRet;
+		}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
+		}
+
+		// resume other threads execution 
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return Ret;
+	}
+
+	// Memory custom hook
+	int32_t InitHookCustomData(Hook_Info** OutputInfo, void* Target, void* CustomData, size_t CSize, int32_t* OutErrorCode)
+	{
+		// Vars
+		Hook_Info* OutputInfoVar		= nullptr;
+		Hook_Info* OutputRet			= nullptr;
+
+		int32_t ErrorC					= 0;
+		int32_t Ret						= 0;
+
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		// arguments 
+		if (OutputInfo && Target && CustomData) {
+			if (IsValidMem(Target, false) && IsValidMem(CustomData, false)) {
+				// check system initialization
+				if (ColdHook_Vars::Inited) {
+					OutputInfoVar = InternalInitializeSTR(false);
+
+					if (OutputInfoVar) {
+						// prepare buffers to save original and hook data
+						OutputInfoVar->COrgData = malloc(CSize);
+						if (OutputInfoVar->COrgData) {
+							memset(OutputInfoVar->COrgData, 0, CSize);
+							OutputInfoVar->CHookData = malloc(CSize);
+							if (OutputInfoVar->CHookData) {
+								memset(OutputInfoVar->CHookData, 0, CSize);
+
+								// Hook
+								DWORD OLDP;
+								if (VirtualProtect(Target, CSize, PAGE_EXECUTE_READWRITE, &OLDP)) {
+									OutputInfoVar->HookSize = CSize;
+									OutputInfoVar->HFunction = Target;
+
+									// Store original and hook data
+									memcpy(OutputInfoVar->COrgData, Target, CSize);
+									memcpy(OutputInfoVar->CHookData, CustomData, CSize);
+
+									// Place hook
+									memcpy(Target, CustomData, CSize);
+
+									OutputInfoVar->StatusHooked = true;
+
+									// restore protection 
+									VirtualProtect(Target, CSize, OLDP, &OLDP);
+
+									OutputRet = OutputInfoVar;
+									++ColdHook_Vars::CurrentID;
+									Ret = ColdHook_Vars::CurrentID;
+								}
+								else {
+									ErrorC = FALIED_MEM_PROTECTION;
+								}
+							}
+							else {
+								free(OutputInfoVar->COrgData);
+								ErrorC = FALIED_BUFFER_CREATION;
+							}
+						}
+						else {
+							ErrorC = FALIED_BUFFER_CREATION;
+						}
+					}
+					else {
+						ErrorC = FALIED_ALLOCATION;
+					}
+				}
+				else {
+					ErrorC = FALIED_NEEDS_INITIALIZATION;
+				}
+			}
+			else {
+				ErrorC = FALIED_MEM_PROTECTION;
+			}
+
+			*OutputInfo = OutputRet;
+		}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
+		}
+
+		// resume other threads execution 
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return Ret;
 	}
 
 	// UnHook
 	bool UnHookRegisteredData(int32_t HookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet				= false;
+		int32_t ErrorC			= FALIED_NOT_EXISTS;
 
-		if (HookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				DWORD OldP = NULL;
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->first == HookID) {
-						if (IterS->second.StatusHooked) {
-							if (VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, PAGE_EXECUTE_READWRITE, &OldP)) {
-								std::memcpy(IterS->second.HFunction, IterS->second.OrgData, IterS->second.HookSize);
-								VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, OldP, &OldP);
-								IterS->second.StatusHooked = false;
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = NULL;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return true;
-							}
-							else {
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_UNHOOK;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return false;
-							}
-						}
-						else {
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_NOT_HOOKED;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return false;
-						}
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (HookID) {
+			if (ColdHook_Vars::Inited) {
+				if (!ColdHook_Vars::RegisteredHooks.empty()) {
+					auto pos = ColdHook_Vars::RegisteredHooks.find(HookID);
+					if (pos != ColdHook_Vars::RegisteredHooks.end()) {
+						InternalUnHookRegData(false, pos->second, &ErrorC);
+						bRet = (ErrorC == 0);
 					}
-					IterS++;
 				}
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_HOOK_NOT_EXISTS;
-				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
 			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
 			}
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 	bool HookAgainRegisteredData(int32_t HookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet				= false;
+		int32_t ErrorC			= FALIED_NOT_EXISTS;
 
-		if (HookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				DWORD OldP = NULL;
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->first == HookID) {
-						if (!IterS->second.StatusHooked) {
-							if (VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, PAGE_EXECUTE_READWRITE, &OldP)) {
-								std::memcpy(IterS->second.HFunction, IterS->second.HookData, IterS->second.HookSize);
-								VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, OldP, &OldP);
-								IterS->second.StatusHooked = true;
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = NULL;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return true;
-							}
-							else {
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = FALIED_HOOK;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return false;
-							}
-						}
-						else {
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_ALREADY_EXISTS;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return false;
-						}
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (HookID) {
+			if (ColdHook_Vars::Inited) {
+				if (!ColdHook_Vars::RegisteredHooks.empty()) {
+					auto pos = ColdHook_Vars::RegisteredHooks.find(HookID);
+					if (pos != ColdHook_Vars::RegisteredHooks.end()) {
+						InternalHookRegData(pos->second, &ErrorC);
+						bRet = (ErrorC == 0);
 					}
-					IterS++;
 				}
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_HOOK_NOT_EXISTS;
-				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
 			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
 			}
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 
 	// Init And shut down
 	bool ServiceGlobalInit(int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet				= false;
+		int32_t ErrorC			= 0;
 
-		if (!ColdHook_Vars::Inited)
-		{
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		// init the service 
+		if (!ColdHook_Vars::Inited) {
+			// init disassembler 
+			if (Is64BitProcess()) {
+				ZydisDecoderInit(&ColdHook_Vars::decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
+			} else {
+				ZydisDecoderInit(&ColdHook_Vars::decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_ADDRESS_WIDTH_32);
+			}
+
+			ColdHook_Vars::Inited = true;
+			ColdHook_Vars::CurrentID = 0;
+			bRet = ColdHook_Vars::Inited;
+		}
+		else {
+			ErrorC = FALIED_ALREADY_INITIALIZED;
+		}
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
+	}
+	bool ServiceGlobalShutDown(bool UnHook, int32_t* OutErrorCode)
+	{
+		bool bRet					= false;
+		int32_t ErrorC				= 0;
+
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (ColdHook_Vars::Inited) {
 			if (!ColdHook_Vars::RegisteredHooks.empty()) {
+				if (UnHook) {
+					for (auto iter = ColdHook_Vars::RegisteredHooks.begin(); iter != ColdHook_Vars::RegisteredHooks.end(); ++iter) {
+						if (iter->second) {
+							InternalUnHookRegData(true, iter->second, &ErrorC);
+							if (ErrorC != 0)
+								if (ErrorC != FALIED_HOOK_NOT_EXISTS)
+									break;
+						}
+					}
+				}
 				ColdHook_Vars::RegisteredHooks.clear();
 			}
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = NULL;
-			}
-
-			// Init Zydis and Keystone
-			ks_err err;
-			if (ColdHook_Service::Is64BitProcess()) {
-				ZydisDecoderInit(&ColdHook_Vars::decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
-				err = ks_open(KS_ARCH_X86, KS_MODE_64, &ColdHook_Vars::ks);
-			}
-			else {
-				ZydisDecoderInit(&ColdHook_Vars::decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_ADDRESS_WIDTH_32);
-				err = ks_open(KS_ARCH_X86, KS_MODE_32, &ColdHook_Vars::ks);
-			}
-			if (err != KS_ERR_OK) {
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_KEYSTONE_INIT;
-				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
-			}
-			ColdHook_Vars::Inited = true;
-			ColdHook_Vars::CurrentID = NULL;
-			ColdHook_Vars::Thread.unlock();
-
-			return true;
+			ColdHook_Vars::Inited = (ErrorC == 0) ? false : true;
+			bRet = (ColdHook_Vars::Inited == false);
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_ALREADY_INITIALIZED;
-			}
+		else {
+			ErrorC = FALIED_NEEDS_INITIALIZATION;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
-	}
-	bool ServiceGlobalShutDown(int32_t* OutErrorCode)
-	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
 
-		if (ColdHook_Vars::Inited)
-		{
-			DWORD OldP = NULL;
-			int32_t ErrorC = NULL;
-			auto IterS = ColdHook_Vars::RegisteredHooks.begin();
+		LockOrUnlockOtherThreads(false);
 
-			if (!ColdHook_Vars::RegisteredHooks.empty())
-			{
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->second.StatusHooked)
-					{
-						if (VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, PAGE_EXECUTE_READWRITE, &OldP))
-						{
-							std::memcpy(IterS->second.HFunction, IterS->second.OrgData, IterS->second.HookSize);
-							VirtualProtect(IterS->second.HFunction, IterS->second.HookSize, OldP, &OldP);
-							if (!VirtualFree(IterS->second.OrgData, IterS->second.HookSize + 1, MEM_DECOMMIT)) {
-								ErrorC = FALIED_FREE_MEMORY;
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = ErrorC;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return false;
-							}
-							if (!VirtualFree(IterS->second.HookData, IterS->second.HookSize + 1, MEM_DECOMMIT)) {
-								ErrorC = FALIED_FREE_MEMORY;
-								if (OutErrorCode > NULL) {
-									*OutErrorCode = ErrorC;
-								}
-								ColdHook_Vars::Thread.unlock();
-								return false;
-							}
-
-							if (IterS->second.Trampoline)
-							{
-								if (!VirtualFree(IterS->second.TrampolinePage, NULL, MEM_RELEASE)) {
-									ErrorC = FALIED_FREE_MEMORY;
-									if (OutErrorCode > NULL) {
-										*OutErrorCode = ErrorC;
-									}
-									ColdHook_Vars::Thread.unlock();
-									return false;
-								}
-							}
-						}
-						else {
-							ErrorC = FALIED_UNHOOK;
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = ErrorC;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return false;
-						}
-					}
-					else
-					{
-						if (IterS->second.Trampoline)
-						{
-							if (!VirtualFree(IterS->second.TrampolinePage, NULL, MEM_RELEASE)) {
-								ErrorC = FALIED_FREE_MEMORY;
-							}
-						}
-					}
-					ColdHook_Vars::RegisteredHooks.erase(IterS);
-					IterS++;
-				}
-			}
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = ErrorC;
-			}
-
-			ks_close(ColdHook_Vars::ks);
-			ColdHook_Vars::Inited = false;
-			ColdHook_Vars::CurrentID = NULL;
-			ColdHook_Vars::Thread.unlock();
-
-			return true;
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-			}
-		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+		return bRet;
 	}
 
 	// Informations
-	bool RetrieveHookInfoByID(Hook_Info* OutputInfo, int32_t HookID, int32_t* OutErrorCode)
+	bool RetrieveHookInfoByID(Hook_Info** OutputInfo, int32_t HookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet						= false;
 
-		if (OutputInfo > NULL && HookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->first == HookID) {
-						std::memcpy(OutputInfo, &IterS->second, sizeof(Hook_Info));
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = NULL;
-						}
-						ColdHook_Vars::Thread.unlock();
-						return true;
+		Hook_Info* Ret					= nullptr;
+		int32_t ErrorC					= FALIED_HOOK_NOT_EXISTS;
+
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (OutputInfo && HookID) {
+			if (ColdHook_Vars::Inited) {
+				if (!ColdHook_Vars::RegisteredHooks.empty()) {
+					auto pos = ColdHook_Vars::RegisteredHooks.find(HookID);
+					if (pos != ColdHook_Vars::RegisteredHooks.end()) {
+						ErrorC = 0;
+						Ret = pos->second;
+						bRet = true;
 					}
-					IterS++;
-				}
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_HOOK_NOT_EXISTS;
-				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
-			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
 				}
 			}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
+			}
+
+			*OutputInfo = Ret;
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 	bool RetrieveHookIDByInfo(Hook_Info* InputInfo, int32_t* OutHookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet						= false;
 
-		if (InputInfo > NULL && OutHookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (std::memcmp(InputInfo, &IterS->second, sizeof(Hook_Info)) == 0) {
-						*OutHookID = IterS->first;
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = NULL;
+		int32_t HookID					= 0;
+		int32_t ErrorC					= FALIED_HOOK_NOT_EXISTS;
+
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (InputInfo && OutHookID) {
+			if (ColdHook_Vars::Inited) {
+				if (!ColdHook_Vars::RegisteredHooks.empty()) {
+					for (auto iter = ColdHook_Vars::RegisteredHooks.begin(); iter != ColdHook_Vars::RegisteredHooks.end(); ++iter) {
+						if (iter->second) {
+							if (iter->second == InputInfo) {
+								HookID = iter->first;
+								ErrorC = 0;
+								bRet = true;
+							}
 						}
-						ColdHook_Vars::Thread.unlock();
-						return true;
 					}
-					IterS++;
-				}
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_HOOK_NOT_EXISTS;
-				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
-			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
 				}
 			}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
+			}
+
+			*OutHookID = HookID;
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 
 	bool ServiceRegisterHookInformation(Hook_Info* InputInfo, int32_t HookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet					= false;
+		int32_t ErrorC				= 0;
 
-		if (InputInfo > NULL && HookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				Hook_Info hkinfo;
-				std::memcpy(&hkinfo, InputInfo, sizeof(Hook_Info));
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
 
-				// Check if is already registered
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->first == HookID) {
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = FALIED_ALREADY_EXISTS;
-						}
-						ColdHook_Vars::Thread.unlock();
-						return false;
-					}
-					if (std::memcmp(InputInfo, &IterS->second, sizeof(Hook_Info)) == 0) {
-						if (OutErrorCode > NULL) {
-							*OutErrorCode = FALIED_ALREADY_EXISTS;
-						}
-						ColdHook_Vars::Thread.unlock();
-						return false;
-					}
-					IterS++;
+		if (InputInfo && HookID) {
+			if (ColdHook_Vars::Inited) {
+				if (!IsHookAlreadyRegistered(HookID)) {
+					ColdHook_Vars::RegisteredHooks.insert(std::make_pair(HookID, InputInfo));
+					bRet = true;
 				}
-				ColdHook_Vars::RegisteredHooks.insert(std::make_pair(HookID, hkinfo));
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = NULL;
+				else {
+					ErrorC = FALIED_ALREADY_EXISTS;
 				}
-				ColdHook_Vars::Thread.unlock();
-				return true;
 			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
 			}
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 	bool ServiceUnRegisterHookInformation(int32_t HookID, int32_t* OutErrorCode)
 	{
-		// Safe thread 
-		ColdHook_Vars::Thread.lock();
+		bool bRet					= false;
+		int32_t ErrorC				= 0;
 
-		if (HookID > NULL)
-		{
-			if (ColdHook_Vars::Inited)
-			{
-				// Check if is registered
-				auto IterS = ColdHook_Vars::RegisteredHooks.begin();
-				while (IterS != ColdHook_Vars::RegisteredHooks.end())
-				{
-					if (IterS->first == HookID) {
-						if (!IterS->second.StatusHooked) {
-							ColdHook_Vars::RegisteredHooks.erase(IterS);
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = NULL;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return true;
-						}
-						else {
-							if (OutErrorCode > NULL) {
-								*OutErrorCode = FALIED_NOT_ALLOWED;
-							}
-							ColdHook_Vars::Thread.unlock();
-							return false;
-						}
-					}
-					IterS++;
+		// suspend other threads execution
+		LockOrUnlockOtherThreads(true);
+
+		if (HookID) {
+			if (ColdHook_Vars::Inited) {
+				if (IsHookAlreadyRegistered(HookID)) {
+					ColdHook_Vars::RegisteredHooks.erase(ColdHook_Vars::RegisteredHooks.find(HookID));
+					bRet = true;
 				}
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NOT_EXISTS;
+				else {
+					ErrorC = FALIED_NOT_EXISTS;
 				}
-				ColdHook_Vars::Thread.unlock();
-				return false;
 			}
-			else
-			{
-				if (OutErrorCode > NULL) {
-					*OutErrorCode = FALIED_NEEDS_INITIALIZATION;
-				}
+			else {
+				ErrorC = FALIED_NEEDS_INITIALIZATION;
 			}
 		}
-		else
-		{
-			if (OutErrorCode > NULL) {
-				*OutErrorCode = FALIED_INVALID_PARAMETER;
-			}
+		else {
+			ErrorC = FALIED_INVALID_PARAMETER;
 		}
-		ColdHook_Vars::Thread.unlock();
-		return false;
+
+		LockOrUnlockOtherThreads(false);
+
+		if (OutErrorCode) {
+			*OutErrorCode = ErrorC;
+		}
+		return bRet;
 	}
 
 	// Arch
 	bool Is64BitProcess()
 	{
-#ifdef _WIN64
-		return true;
-#else
-		return false;
-#endif
+		HMODULE hMain				= nullptr;
+		IMAGE_NT_HEADERS* pNt		= nullptr;
+
+		hMain = GetModuleHandleA(nullptr);
+		if (!hMain) {
+			for (int i = 0; i < sizeof(ColdHook_Vars::pSystemMods); i++) {
+				hMain = GetModuleHandleA(ColdHook_Vars::pSystemMods[i]);
+				if (hMain)
+					break;
+			}
+		}
+
+		pNt = (IMAGE_NT_HEADERS*)((ULONG_PTR)hMain + (((IMAGE_DOS_HEADER*)hMain)->e_lfanew));
+		return (pNt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64);
 	}
 
 	// Error handler 
@@ -1448,7 +1683,7 @@ namespace ColdHook_Service
 		const char* ErrorString;
 		switch (InErrorCode)
 		{
-		case NULL:
+		case 0:
 			ErrorString = "SUCCESS_NO_ERROR";
 			break;
 		case FALIED_NEEDS_INITIALIZATION:
@@ -1511,11 +1746,14 @@ namespace ColdHook_Service
 		case FALIED_OUT_RANGE:
 			ErrorString = "FALIED_OUT_RANGE";
 			break;
-		case FALIED_KEYSTONE_INIT:
-			ErrorString = "FALIED_KEYSTONE_INIT";
+		case FALIED_TRAMPOLINE_NOT_FOUND:
+			ErrorString = "FALIED_TRAMPOLINE_NOT_FOUND";
 			break;
-		case WARN_32_BIT:
-			ErrorString = "WARN_32_BIT";
+		case FALIED_HOOK_STILL_EXISTS_ACCESS_DENIED:
+			ErrorString = "FALIED_HOOK_STILL_EXISTS_ACCESS_DENIED";
+			break;
+		case FALIED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND:
+			ErrorString = "FALIED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND";
 			break;
 		default:
 			ErrorString = "Unknown error";
