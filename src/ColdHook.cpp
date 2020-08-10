@@ -1196,6 +1196,9 @@ namespace ColdHook_Service
 			}
 			// Get function pointer
 			CurFunction = GetProcAddress(GetModuleHandleA(ModuleN), FName);
+			if(!CurFunction)
+				CurFunction = GetProcAddress(GetModuleHandleA(ModulName), FName);
+
 			Ret = InitFunctionHookByAddress(OutputInfo, WrapFunction, CurFunction, HookedF, &ErrorC);
 
 		} else {

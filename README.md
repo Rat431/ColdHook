@@ -23,7 +23,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     -  #### Syntax
         ```cpp
             int32_t InitFunctionHookByName(
-                Hook_Info* OutputInfo, 
+                Hook_Info** OutputInfo, 
                 bool WrapFunction, 
                 bool CheckKBase, 
                 const char* ModulName, 
@@ -34,7 +34,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer to the **Hook_Info** structure to retrieve hook informations.
+            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `WrapFunction`
     
@@ -58,7 +58,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -71,7 +71,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     -  #### Syntax
         ```cpp
             int32_t InitFunctionHookByAddress(
-                Hook_Info* OutputInfo, 
+                Hook_Info** OutputInfo, 
                 bool WrapFunction, 
                 void* Target, 
                 void* HookedF, 
@@ -80,7 +80,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer to the **Hook_Info** structure to retrieve hook informations.
+            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `WrapFunction`
     
@@ -96,7 +96,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -108,7 +108,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     -  #### Syntax
         ```cpp
             int32_t InitHookCustomData(
-                Hook_Info* OutputInfo, 
+                Hook_Info** OutputInfo, 
                 void* Target, 
                 void* CustomData, 
                 size_t CSize, 
@@ -117,7 +117,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer to the **Hook_Info** structure to retrieve hook informations.
+            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `Target`
             
@@ -133,7 +133,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -155,7 +155,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -177,7 +177,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -194,7 +194,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -215,7 +215,7 @@ Read the functions documentation just below to understand how ColdHook must be u
 			
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -227,7 +227,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     -  #### Syntax
         ```cpp
             bool RetrieveHookInfoByID(
-                Hook_Info* OutputInfo, 
+                Hook_Info** OutputInfo, 
                 int32_t HookID, 
                 int32_t* OutErrorCode);
          ```
@@ -235,7 +235,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `OutputInfo`
     
-            A pointer to the **Hook_Info** structure to retrieve hook informations.
+            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
     
         - `HookID`
     
@@ -243,7 +243,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -267,11 +267,11 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `OutHookID`
     
-             A pointer to a variable that will recieve the registered hook ID.
+             A pointer to a variable that will receive the registered hook ID.
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -299,7 +299,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
@@ -322,7 +322,7 @@ Read the functions documentation just below to understand how ColdHook must be u
             
         - `OutErrorCode`
         
-            A pointer to a variable that will recieve the error id if the function fails. This paramater can be **NULL**.
+            A pointer to a variable that will receive the error id if the function fails. This paramater can be **NULL**.
             
     -  #### Return value
         
