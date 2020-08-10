@@ -151,7 +151,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `HookID`
     
-            The hook ID returned by the hook initialisers functions.
+            The hook ID returned by the hook initializers functions.
             
         - `OutErrorCode`
         
@@ -173,7 +173,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `HookID`
     
-            The hook ID returned by the hook initialisers functions.
+            The hook ID returned by the hook initializers functions.
             
         - `OutErrorCode`
         
@@ -239,7 +239,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `HookID`
     
-            The hook ID returned by the hook initialisers functions.
+            The hook ID returned by the hook initializers functions.
             
         - `OutErrorCode`
         
@@ -295,7 +295,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `HookID`
     
-            The hook ID returned by the hook initialisers functions.
+            The hook ID returned by the hook initializers functions.
             
         - `OutErrorCode`
         
@@ -318,7 +318,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `HookID`
     
-            The hook ID returned by the hook initialisers functions.
+            The hook ID returned by the hook initializers functions.
             
         - `OutErrorCode`
         
