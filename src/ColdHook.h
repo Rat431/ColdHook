@@ -78,29 +78,29 @@ enum OffsetTypes
 // Errors
 enum CH_Error_Info
 {
-	FALIED_NEEDS_INITIALIZATION = 40,
-	FALIED_ALREADY_INITIALIZED,
-	FALIED_HOOK_EXISTS,
-	FALIED_HOOK_NOT_EXISTS,
-	FALIED_BUFFER_CREATION,
-	FALIED_INVALID_PARAMETER,
-	FALIED_ALREADY_EXISTS,
-	FALIED_NOT_EXISTS,
-	FALIED_FREE_MEMORY,
-	FALIED_UNHOOK,
-	FALIED_HOOK,
-	FALIED_NOT_ALLOWED,
-	FALIED_NOT_HOOKED,
-	FALIED_ALLOCATION,
-	FALIED_NO_ACCESS,
-	FALIED_DISASSEMBLER,
-	FALIED_MEM_PROTECTION,
-	FALIED_MODULE_NOT_FOUND,
-	FALIED_FUNCTION_NOT_FOUND,
-	FALIED_OUT_RANGE,
-	FALIED_TRAMPOLINE_NOT_FOUND,
-	FALIED_HOOK_STILL_EXISTS_ACCESS_DENIED,
-	FALIED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND
+	FAILED_NEEDS_INITIALIZATION = 40,
+	FAILED_ALREADY_INITIALIZED,
+	FAILED_HOOK_EXISTS,
+	FAILED_HOOK_NOT_EXISTS,
+	FAILED_BUFFER_CREATION,
+	FAILED_INVALID_PARAMETER,
+	FAILED_ALREADY_EXISTS,
+	FAILED_NOT_EXISTS,
+	FAILED_FREE_MEMORY,
+	FAILED_UNHOOK,
+	FAILED_HOOK,
+	FAILED_NOT_ALLOWED,
+	FAILED_NOT_HOOKED,
+	FAILED_ALLOCATION,
+	FAILED_NO_ACCESS,
+	FAILED_DISASSEMBLER,
+	FAILED_MEM_PROTECTION,
+	FAILED_MODULE_NOT_FOUND,
+	FAILED_FUNCTION_NOT_FOUND,
+	FAILED_OUT_RANGE,
+	FAILED_TRAMPOLINE_NOT_FOUND,
+	FAILED_HOOK_STILL_EXISTS_ACCESS_DENIED,
+	FAILED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND
 };
 
 struct Hook_Info
@@ -133,13 +133,13 @@ namespace ColdHook_Service
 	static void* FindTrampoline(void* StartBaseAddress, size_t Size, bool UseCodeCave, int* pAllocated, DWORD* pCaveOProtection);
 
 	static size_t FixInstruction(void* pTarget, void* pNewPointer, bool bIsRelative, int DispValue, size_t CurrentInsLength);
-	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFalied);
+	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFailed);
 	static size_t PlaceOffsetJump(void* pDestination, void* pTarget, void* pMemory);
 	static size_t PlaceAbsJump(void* pDestination, void* pMemory);
 	static WORD ConvertOpcode(void* pInstruction, InstructionType InsType, bool bToLong);
 
 	static int BuildInstructionTypeDisplaceMent(void* pDestination, void* pTarget, InstructionType InsType, size_t* pNeededEncodeLength,
-		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFalied);
+		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFailed);
 
 	static InstructionType GetInstructionTypeFromOffsetType(OffsetTypes OffType);
 	static OffsetTypes GetInstructionOffType(void* pInstruction);

@@ -34,7 +34,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
+            A pointer to a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `WrapFunction`
     
@@ -80,7 +80,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
+            A pointer to a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `WrapFunction`
     
@@ -117,7 +117,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     - ### Arguments
         - `OutputInfo`
     
-            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
+            A pointer to a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
             
         - `Target`
             
@@ -235,7 +235,7 @@ Read the functions documentation just below to understand how ColdHook must be u
     
         - `OutputInfo`
     
-            A pointer of a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
+            A pointer to a variable pointer that will receive the **Hook_Info** structure to retrieve hook informations.
     
         - `HookID`
     

@@ -352,7 +352,7 @@ namespace ColdHook_Service
 
 		bool ReCompileJumpN							= false;
 		bool IsLong									= false;
-		bool Falied									= false;
+		bool Failed									= false;
 
 		if (!bIsRelative) {
 			memcpy(pNewPointer, pTarget, CurrentInsLength);
@@ -371,8 +371,8 @@ namespace ColdHook_Service
 				if (DestAddress) {
 					IInstructionType = GetInstructionTypeFromOffsetType(OffsetInstructionType);
 					NewDisplaceMent = BuildInstructionTypeDisplaceMent(DestAddress, pNewPointer, IInstructionType,
-						&EncodedInsSize, &DDisplacementOffset, 0, &IsLong, &Falied);
-					if (!Falied) {
+						&EncodedInsSize, &DDisplacementOffset, 0, &IsLong, &Failed);
+					if (!Failed) {
 						ReCompileJumpN = MustInstructionBeFixed(OffsetInstructionType, IsLong);
 						EncodeDisplaceMentInstruction(pNewPointer, pTarget, NewDisplaceMent, IInstructionType, ReCompileJumpN, IsLong, EncodedInsSize,
 							DDisplacementOffset);
@@ -380,12 +380,12 @@ namespace ColdHook_Service
 				}
 			}
 			else {
-				DDisplacementOffset = GetDisplacementOffset(pTarget, DispValue, CurrentInsLength, &Falied);
-				if (!Falied) {
+				DDisplacementOffset = GetDisplacementOffset(pTarget, DispValue, CurrentInsLength, &Failed);
+				if (!Failed) {
 					DestAddress = GetAddressFromOffset(pTarget, OffsetInstructionType, DDisplacementOffset, CurrentInsLength, false, false);
 					if (DestAddress) {
 						NewDisplaceMent = BuildInstructionTypeDisplaceMent(DestAddress, pNewPointer, IInstructionType,
-							&EncodedInsSize, nullptr, CurrentInsLength, &IsLong, &Falied);
+							&EncodedInsSize, nullptr, CurrentInsLength, &IsLong, &Failed);
 						EncodeDisplaceMentInstruction(pNewPointer, pTarget, NewDisplaceMent, IInstructionType, ReCompileJumpN, IsLong, EncodedInsSize,
 							DDisplacementOffset);
 					}
@@ -394,25 +394,25 @@ namespace ColdHook_Service
 		}
 		return EncodedInsSize;
 	}
-	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFalied)
+	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFailed)
 	{
 		// search for the displacement value offset relative to beginning of the instruction.
-		bool Falied						= true;
+		bool Failed						= true;
 		size_t DispOffRet				= 0;
 
 		if (pInstruction && InsLength) {
 			for (size_t i = (InsLength - sizeof(int)); i > 0; i--) {
 				if (*(int*)((ULONG_PTR)pInstruction + i) == DisplaceMent) {
-					Falied = false;
+					Failed = false;
 					DispOffRet = i;
 					break;
 				}
 			}
-			if (Falied) {
+			if (Failed) {
 				// search for 1 signed byte
 				for (size_t i = (InsLength - sizeof(char)); i > 0; i--) {
 					if (*(char*)((ULONG_PTR)pInstruction + i) == (char)DisplaceMent) {
-						Falied = false;
+						Failed = false;
 						DispOffRet = i;
 						break;
 					}
@@ -420,8 +420,8 @@ namespace ColdHook_Service
 			}
 		}
 
-		if (pbFalied) {
-			*pbFalied = Falied;
+		if (pbFailed) {
+			*pbFailed = Failed;
 		}
 		return DispOffRet;
 	}
@@ -485,7 +485,7 @@ namespace ColdHook_Service
 	}
 
 	static int BuildInstructionTypeDisplaceMent(void* pDestination, void* pTarget, InstructionType InsType, size_t* pNeededEncodeLength,
-		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFalied)
+		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFailed)
 	{
 		DisplacementVar RealDisplacement			= 0;
 		SIZE_T TSize								= 0;
@@ -494,7 +494,7 @@ namespace ColdHook_Service
 		size_t DisplacementOffset					= 0;
 		int Flag									= EQUAL;
 
-		bool Falied									= false;
+		bool Failed									= false;
 		bool NotConfirmedInRange					= false;
 		bool InRange								= false;
 		bool LongJ									= false;
@@ -524,7 +524,7 @@ namespace ColdHook_Service
 					if (Flag == NEGATIVE) {
 						if (TSize > MAX_COND_SHORT_JUMP_OFFSET_N) {
 							if (InsType == TSPECIAL__GENERAL_JUMP_C)
-								Falied = true;
+								Failed = true;
 							else
 								LongJ = true;
 						} else {
@@ -534,7 +534,7 @@ namespace ColdHook_Service
 					else if (Flag == POSITIVE) {
 						if (TSize > MAX_COND_SHORT_JUMP_OFFSET_P) {
 							if (InsType == TSPECIAL__GENERAL_JUMP_C)
-								Falied = true;
+								Failed = true;
 							else
 								LongJ = true;
 						} else {
@@ -544,7 +544,7 @@ namespace ColdHook_Service
 					else {
 						LongJ = false;
 					}
-					if (!Falied) {
+					if (!Failed) {
 						if (LongJ) {
 							if (InsType == TCONDITIONAL_GENERAL_JUMP) {
 								// for coditional jumps
@@ -587,13 +587,13 @@ namespace ColdHook_Service
 				}
 			}
 			else
-				Falied = true;
+				Failed = true;
 		}
 		else
-			Falied = true;
+			Failed = true;
 
-		if (pbFalied) {
-			*pbFalied = Falied;
+		if (pbFailed) {
+			*pbFailed = Failed;
 		}
 		if (pNeededEncodeLength) {
 			*pNeededEncodeLength = NeededEncodeLength;
@@ -738,7 +738,7 @@ namespace ColdHook_Service
 		bool IsLong, size_t EncodeSize, size_t DispOffset)
 	{
 		bool Continue				= false;
-		bool Falied					= false;
+		bool Failed					= false;
 		WORD CnvOpcode				= 0;
 
 		if (pMemory && EncodeSize && pOldOpCode) {
@@ -751,7 +751,7 @@ namespace ColdHook_Service
 					Continue = true;
 				}
 				else
-					Falied = true;
+					Failed = true;
 			}
 			else {
 				Continue = true;
@@ -764,8 +764,8 @@ namespace ColdHook_Service
 			}
 		}
 		else
-			Falied = true;
-		return (Falied != true);
+			Failed = true;
+		return (Failed != true);
 	}
 	static bool SearchAddressThroughSecs(void* ModBase, void* CurAddr, void** OutSBaseAddr, size_t* pSize)
 	{
@@ -903,12 +903,12 @@ namespace ColdHook_Service
 				}
 				else 
 				{
-					ErrorC = FALIED_MEM_PROTECTION;
+					ErrorC = FAILED_MEM_PROTECTION;
 				}
 			} 
 			else
 			{
-				ErrorC = FALIED_HOOK_NOT_EXISTS;
+				ErrorC = FAILED_HOOK_NOT_EXISTS;
 			}
 		}
 
@@ -943,7 +943,7 @@ namespace ColdHook_Service
 								}
 								else
 								{
-									ErrorC = FALIED_MEM_PROTECTION;
+									ErrorC = FAILED_MEM_PROTECTION;
 									pData->StatusHooked = false;
 								}
 							}
@@ -968,12 +968,12 @@ namespace ColdHook_Service
 				}
 				else
 				{
-					ErrorC = FALIED_MEM_PROTECTION;
+					ErrorC = FAILED_MEM_PROTECTION;
 				}
 			}
 			else
 			{
-				ErrorC = FALIED_HOOK_EXISTS;
+				ErrorC = FAILED_HOOK_EXISTS;
 			}
 		}
 
@@ -1017,7 +1017,7 @@ namespace ColdHook_Service
 			}
 		}
 		else
-			ErrorCode = FALIED_MEM_PROTECTION;
+			ErrorCode = FAILED_MEM_PROTECTION;
 
 		if (pOutErrorCode) {
 			*pOutErrorCode = ErrorCode;
@@ -1160,13 +1160,13 @@ namespace ColdHook_Service
 					}
 				}
 				else
-					ErrorCode = FALIED_DISASSEMBLER;
+					ErrorCode = FAILED_DISASSEMBLER;
 			}
 			else
-				ErrorCode = FALIED_TRAMPOLINE_NOT_FOUND;
+				ErrorCode = FAILED_TRAMPOLINE_NOT_FOUND;
 		}
 		else
-			ErrorCode = FALIED_MEM_PROTECTION;
+			ErrorCode = FAILED_MEM_PROTECTION;
 
 		if (pOutErrorCode) {
 			*pOutErrorCode = ErrorCode;
@@ -1202,7 +1202,7 @@ namespace ColdHook_Service
 			Ret = InitFunctionHookByAddress(OutputInfo, WrapFunction, CurFunction, HookedF, &ErrorC);
 
 		} else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		if (OutErrorCode) {
@@ -1258,21 +1258,21 @@ namespace ColdHook_Service
 							Ret = ColdHook_Vars::CurrentID;
 						}
 						else {
-							ErrorC = FALIED_MEM_PROTECTION;
+							ErrorC = FAILED_MEM_PROTECTION;
 						}
 					}
 				}
 				else {
-					ErrorC = FALIED_ALLOCATION;
+					ErrorC = FAILED_ALLOCATION;
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 			*OutputInfo = OutputRet;
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		// resume other threads execution 
@@ -1336,34 +1336,34 @@ namespace ColdHook_Service
 									Ret = ColdHook_Vars::CurrentID;
 								}
 								else {
-									ErrorC = FALIED_MEM_PROTECTION;
+									ErrorC = FAILED_MEM_PROTECTION;
 								}
 							}
 							else {
 								free(OutputInfoVar->COrgData);
-								ErrorC = FALIED_BUFFER_CREATION;
+								ErrorC = FAILED_BUFFER_CREATION;
 							}
 						}
 						else {
-							ErrorC = FALIED_BUFFER_CREATION;
+							ErrorC = FAILED_BUFFER_CREATION;
 						}
 					}
 					else {
-						ErrorC = FALIED_ALLOCATION;
+						ErrorC = FAILED_ALLOCATION;
 					}
 				}
 				else {
-					ErrorC = FALIED_NEEDS_INITIALIZATION;
+					ErrorC = FAILED_NEEDS_INITIALIZATION;
 				}
 			}
 			else {
-				ErrorC = FALIED_MEM_PROTECTION;
+				ErrorC = FAILED_MEM_PROTECTION;
 			}
 
 			*OutputInfo = OutputRet;
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		// resume other threads execution 
@@ -1379,7 +1379,7 @@ namespace ColdHook_Service
 	bool UnHookRegisteredData(int32_t HookID, int32_t* OutErrorCode)
 	{
 		bool bRet				= false;
-		int32_t ErrorC			= FALIED_NOT_EXISTS;
+		int32_t ErrorC			= FAILED_NOT_EXISTS;
 
 		// suspend other threads execution
 		LockOrUnlockOtherThreads(true);
@@ -1395,11 +1395,11 @@ namespace ColdHook_Service
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1412,7 +1412,7 @@ namespace ColdHook_Service
 	bool HookAgainRegisteredData(int32_t HookID, int32_t* OutErrorCode)
 	{
 		bool bRet				= false;
-		int32_t ErrorC			= FALIED_NOT_EXISTS;
+		int32_t ErrorC			= FAILED_NOT_EXISTS;
 
 		// suspend other threads execution
 		LockOrUnlockOtherThreads(true);
@@ -1428,11 +1428,11 @@ namespace ColdHook_Service
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1466,7 +1466,7 @@ namespace ColdHook_Service
 			bRet = ColdHook_Vars::Inited;
 		}
 		else {
-			ErrorC = FALIED_ALREADY_INITIALIZED;
+			ErrorC = FAILED_ALREADY_INITIALIZED;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1491,7 +1491,7 @@ namespace ColdHook_Service
 						if (iter->second) {
 							InternalUnHookRegData(true, iter->second, &ErrorC);
 							if (ErrorC != 0)
-								if (ErrorC != FALIED_HOOK_NOT_EXISTS)
+								if (ErrorC != FAILED_HOOK_NOT_EXISTS)
 									break;
 						}
 					}
@@ -1502,7 +1502,7 @@ namespace ColdHook_Service
 			bRet = (ColdHook_Vars::Inited == false);
 		}
 		else {
-			ErrorC = FALIED_NEEDS_INITIALIZATION;
+			ErrorC = FAILED_NEEDS_INITIALIZATION;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1519,7 +1519,7 @@ namespace ColdHook_Service
 		bool bRet						= false;
 
 		Hook_Info* Ret					= nullptr;
-		int32_t ErrorC					= FALIED_HOOK_NOT_EXISTS;
+		int32_t ErrorC					= FAILED_HOOK_NOT_EXISTS;
 
 		// suspend other threads execution
 		LockOrUnlockOtherThreads(true);
@@ -1536,13 +1536,13 @@ namespace ColdHook_Service
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 
 			*OutputInfo = Ret;
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1557,7 +1557,7 @@ namespace ColdHook_Service
 		bool bRet						= false;
 
 		int32_t HookID					= 0;
-		int32_t ErrorC					= FALIED_HOOK_NOT_EXISTS;
+		int32_t ErrorC					= FAILED_HOOK_NOT_EXISTS;
 
 		// suspend other threads execution
 		LockOrUnlockOtherThreads(true);
@@ -1577,13 +1577,13 @@ namespace ColdHook_Service
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 
 			*OutHookID = HookID;
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1609,15 +1609,15 @@ namespace ColdHook_Service
 					bRet = true;
 				}
 				else {
-					ErrorC = FALIED_ALREADY_EXISTS;
+					ErrorC = FAILED_ALREADY_EXISTS;
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1642,15 +1642,15 @@ namespace ColdHook_Service
 					bRet = true;
 				}
 				else {
-					ErrorC = FALIED_NOT_EXISTS;
+					ErrorC = FAILED_NOT_EXISTS;
 				}
 			}
 			else {
-				ErrorC = FALIED_NEEDS_INITIALIZATION;
+				ErrorC = FAILED_NEEDS_INITIALIZATION;
 			}
 		}
 		else {
-			ErrorC = FALIED_INVALID_PARAMETER;
+			ErrorC = FAILED_INVALID_PARAMETER;
 		}
 
 		LockOrUnlockOtherThreads(false);
@@ -1689,74 +1689,74 @@ namespace ColdHook_Service
 		case 0:
 			ErrorString = "SUCCESS_NO_ERROR";
 			break;
-		case FALIED_NEEDS_INITIALIZATION:
-			ErrorString = "FALIED_NEEDS_INITIALIZATION";
+		case FAILED_NEEDS_INITIALIZATION:
+			ErrorString = "FAILED_NEEDS_INITIALIZATION";
 			break;
-		case FALIED_ALREADY_INITIALIZED:
-			ErrorString = "FALIED_ALREADY_INITIALIZED";
+		case FAILED_ALREADY_INITIALIZED:
+			ErrorString = "FAILED_ALREADY_INITIALIZED";
 			break;
-		case FALIED_HOOK_EXISTS:
-			ErrorString = "FALIED_HOOK_EXISTS";
+		case FAILED_HOOK_EXISTS:
+			ErrorString = "FAILED_HOOK_EXISTS";
 			break;
-		case FALIED_HOOK_NOT_EXISTS:
-			ErrorString = "FALIED_HOOK_NOT_EXISTS";
+		case FAILED_HOOK_NOT_EXISTS:
+			ErrorString = "FAILED_HOOK_NOT_EXISTS";
 			break;
-		case FALIED_BUFFER_CREATION:
-			ErrorString = "FALIED_BUFFER_CREATION";
+		case FAILED_BUFFER_CREATION:
+			ErrorString = "FAILED_BUFFER_CREATION";
 			break;
-		case FALIED_INVALID_PARAMETER:
-			ErrorString = "FALIED_INVALID_PARAMETER";
+		case FAILED_INVALID_PARAMETER:
+			ErrorString = "FAILED_INVALID_PARAMETER";
 			break;
-		case FALIED_ALREADY_EXISTS:
-			ErrorString = "FALIED_ALREADY_EXISTS";
+		case FAILED_ALREADY_EXISTS:
+			ErrorString = "FAILED_ALREADY_EXISTS";
 			break;
-		case FALIED_NOT_EXISTS:
-			ErrorString = "FALIED_NOT_EXISTS";
+		case FAILED_NOT_EXISTS:
+			ErrorString = "FAILED_NOT_EXISTS";
 			break;
-		case FALIED_FREE_MEMORY:
-			ErrorString = "FALIED_FREE_MEMORY";
+		case FAILED_FREE_MEMORY:
+			ErrorString = "FAILED_FREE_MEMORY";
 			break;
-		case FALIED_UNHOOK:
-			ErrorString = "FALIED_UNHOOK";
+		case FAILED_UNHOOK:
+			ErrorString = "FAILED_UNHOOK";
 			break;
-		case FALIED_HOOK:
-			ErrorString = "FALIED_HOOK";
+		case FAILED_HOOK:
+			ErrorString = "FAILED_HOOK";
 			break;
-		case FALIED_NOT_ALLOWED:
-			ErrorString = "FALIED_NOT_ALLOWED";
+		case FAILED_NOT_ALLOWED:
+			ErrorString = "FAILED_NOT_ALLOWED";
 			break;
-		case FALIED_NOT_HOOKED:
-			ErrorString = "FALIED_NOT_HOOKED";
+		case FAILED_NOT_HOOKED:
+			ErrorString = "FAILED_NOT_HOOKED";
 			break;
-		case FALIED_ALLOCATION:
-			ErrorString = "FALIED_ALLOCATION";
+		case FAILED_ALLOCATION:
+			ErrorString = "FAILED_ALLOCATION";
 			break;
-		case FALIED_NO_ACCESS:
-			ErrorString = "FALIED_NO_ACCESS";
+		case FAILED_NO_ACCESS:
+			ErrorString = "FAILED_NO_ACCESS";
 			break;
-		case FALIED_DISASSEMBLER:
-			ErrorString = "FALIED_DISASSEMBLER";
+		case FAILED_DISASSEMBLER:
+			ErrorString = "FAILED_DISASSEMBLER";
 			break;
-		case FALIED_MEM_PROTECTION:
-			ErrorString = "FALIED_MEM_PROTECTION";
+		case FAILED_MEM_PROTECTION:
+			ErrorString = "FAILED_MEM_PROTECTION";
 			break;
-		case FALIED_MODULE_NOT_FOUND:
-			ErrorString = "FALIED_MODULE_NOT_FOUND";
+		case FAILED_MODULE_NOT_FOUND:
+			ErrorString = "FAILED_MODULE_NOT_FOUND";
 			break;
-		case FALIED_FUNCTION_NOT_FOUND:
-			ErrorString = "FALIED_FUNCTION_NOT_FOUND";
+		case FAILED_FUNCTION_NOT_FOUND:
+			ErrorString = "FAILED_FUNCTION_NOT_FOUND";
 			break;
-		case FALIED_OUT_RANGE:
-			ErrorString = "FALIED_OUT_RANGE";
+		case FAILED_OUT_RANGE:
+			ErrorString = "FAILED_OUT_RANGE";
 			break;
-		case FALIED_TRAMPOLINE_NOT_FOUND:
-			ErrorString = "FALIED_TRAMPOLINE_NOT_FOUND";
+		case FAILED_TRAMPOLINE_NOT_FOUND:
+			ErrorString = "FAILED_TRAMPOLINE_NOT_FOUND";
 			break;
-		case FALIED_HOOK_STILL_EXISTS_ACCESS_DENIED:
-			ErrorString = "FALIED_HOOK_STILL_EXISTS_ACCESS_DENIED";
+		case FAILED_HOOK_STILL_EXISTS_ACCESS_DENIED:
+			ErrorString = "FAILED_HOOK_STILL_EXISTS_ACCESS_DENIED";
 			break;
-		case FALIED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND:
-			ErrorString = "FALIED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND";
+		case FAILED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND:
+			ErrorString = "FAILED_CUSTOM_ORIGINAL_BUFFER_NOT_FOUND";
 			break;
 		default:
 			ErrorString = "Unknown error";
