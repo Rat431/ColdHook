@@ -2,7 +2,8 @@
 
 ColdHook is a mini and simple open source memory hooking library for Windows x86/x64 made in C++. This library is mainly intended for a simple usage and especially for whoever has a small knowlegde of how hooks actually works. If you find any issue, feel free to report.
 
-Read the functions documentation just below to understand how ColdHook must be used.
+Read the functions documentation just below to understand how ColdHook must be used. 
+Feel free to join in the [Discord](https://discord.gg/QPQzR57) channel if you need any help or you have any question.
 
 ## Features
 
