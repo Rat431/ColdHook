@@ -109,11 +109,11 @@ struct Hook_Info
 	bool TrampolineAllocated;
 	bool IsDetourHook;
 
-	void* OriginalF;	// Pointer to the original function 
-	void* HFunction;	// Target hooked/hook pointer 
-	void* TrampolinePage;	// Trampoline address 
-	void* COrgData;
-	void* CHookData;
+	void * OriginalF;	// Pointer to the original function 
+	void * HFunction;	// Target hooked/hook pointer 
+	void * TrampolinePage;	// Trampoline address 
+	void * COrgData;
+	void * CHookData;
 
 	BYTE OrgData[MAX_HOOK_ARRAY];	// original data (for detour)
 	BYTE HookData[MAX_HOOK_ARRAY];	// hook data	(for detour)
@@ -127,64 +127,64 @@ struct Hook_Info
 namespace ColdHook_Service
 {
 	// Private functions:
-	static void* WalkThroughJumpIfPossible(void* pMemory);
-	static void* GetAddressFromOffset(void* Base, OffsetTypes Type, size_t DispOffset, size_t InsLength, bool bReturnDefault, bool bGetInternalP);
-	static void* BeckupOriginalInstructions(void* pTarget, void* pTrampolineStart, size_t JumpHookS, size_t* pOutDLength);
-	static void* FindTrampoline(void* StartBaseAddress, size_t Size, bool UseCodeCave, int* pAllocated, DWORD* pCaveOProtection);
+	static void * WalkThroughJumpIfPossible( void * pMemory );
+	static void * GetAddressFromOffset( void * Base, OffsetTypes Type, size_t DispOffset, size_t InsLength, bool bReturnDefault, bool bGetInternalP );
+	static void * BeckupOriginalInstructions( void * pTarget, void * pTrampolineStart, size_t JumpHookS, size_t * pOutDLength );
+	static void * FindTrampoline( void * StartBaseAddress, size_t Size, bool UseCodeCave, int * pAllocated, DWORD * pCaveOProtection );
 
-	static size_t FixInstruction(void* pTarget, void* pNewPointer, bool bIsRelative, int DispValue, size_t CurrentInsLength);
-	static size_t GetDisplacementOffset(void* pInstruction, int DisplaceMent, size_t InsLength, bool* pbFailed);
-	static size_t PlaceOffsetJump(void* pDestination, void* pTarget, void* pMemory);
-	static size_t PlaceAbsJump(void* pDestination, void* pMemory);
-	static WORD ConvertOpcode(void* pInstruction, InstructionType InsType, bool bToLong);
+	static size_t FixInstruction( void * pTarget, void * pNewPointer, bool bIsRelative, int DispValue, size_t CurrentInsLength );
+	static size_t GetDisplacementOffset( void * pInstruction, int DisplaceMent, size_t InsLength, bool * pbFailed );
+	static size_t PlaceOffsetJump( void * pDestination, void * pTarget, void * pMemory );
+	static size_t PlaceAbsJump( void * pDestination, void * pMemory );
+	static WORD ConvertOpcode( void * pInstruction, InstructionType InsType, bool bToLong );
 
-	static int BuildInstructionTypeDisplaceMent(void* pDestination, void* pTarget, InstructionType InsType, size_t* pNeededEncodeLength,
-		size_t* pNewDisplaceMentOffset, size_t InsLength, bool* pbLongJump, bool* pbFailed);
+	static int BuildInstructionTypeDisplaceMent( void * pDestination, void * pTarget, InstructionType InsType, size_t * pNeededEncodeLength,
+		size_t * pNewDisplaceMentOffset, size_t InsLength, bool * pbLongJump, bool * pbFailed );
 
-	static InstructionType GetInstructionTypeFromOffsetType(OffsetTypes OffType);
-	static OffsetTypes GetInstructionOffType(void* pInstruction);
-	
-	static bool MustInstructionBeFixed(OffsetTypes Type, bool bLongDistance);
-	static bool IsValidMem(void* pMem, bool bWriteAccessNeeded);
-	static bool EncodeDisplaceMentInstruction(void* pMemory, void* pOldOpCode, int offset, InstructionType InsType, bool bConvertOpcode,
-		bool IsLong, size_t EncodeSize, size_t DispOffset);
-	static bool SearchAddressThroughSecs(void* ModBase, void* CurAddr, void** OutSBaseAddr, size_t* pSize);
-	static bool IsValidHeader(void* CurrentBase);
-	static bool IsHookAlreadyRegistered(int32_t HookID);
+	static InstructionType GetInstructionTypeFromOffsetType( OffsetTypes OffType );
+	static OffsetTypes GetInstructionOffType( void * pInstruction );
 
-	static void LockOrUnlockOtherThreads(bool bLock);
+	static bool MustInstructionBeFixed( OffsetTypes Type, bool bLongDistance );
+	static bool IsValidMem( void * pMem, bool bWriteAccessNeeded );
+	static bool EncodeDisplaceMentInstruction( void * pMemory, void * pOldOpCode, int offset, InstructionType InsType, bool bConvertOpcode,
+		bool IsLong, size_t EncodeSize, size_t DispOffset );
+	static bool SearchAddressThroughSecs( void * ModBase, void * CurAddr, void ** OutSBaseAddr, size_t * pSize );
+	static bool IsValidHeader( void * CurrentBase );
+	static bool IsHookAlreadyRegistered( int32_t HookID );
 
-	static Hook_Info* InternalInitializeSTR(bool bDetourHook);
-	static void InternalUnHookRegData(bool ShutDown, Hook_Info* pData, int32_t* OutErrorCode);
-	static void InternalHookRegData(Hook_Info* pData, int32_t* OutErrorCode);
-	static void InternalEmuHook(void* pPlace, void* pDFunction, Hook_Info* OutputInfo, int32_t* pOutErrorCode);
-	static void* InternalDetourHook(void* pPlace, void* pDFunction, Hook_Info* OutputInfo, int32_t* pOutErrorCode);
+	static void LockOrUnlockOtherThreads( bool bLock );
+
+	static Hook_Info * InternalInitializeSTR( bool bDetourHook );
+	static void InternalUnHookRegData( bool ShutDown, Hook_Info * pData, int32_t * OutErrorCode );
+	static void InternalHookRegData( Hook_Info * pData, int32_t * OutErrorCode );
+	static void InternalEmuHook( void * pPlace, void * pDFunction, Hook_Info * OutputInfo, int32_t * pOutErrorCode );
+	static void * InternalDetourHook( void * pPlace, void * pDFunction, Hook_Info * OutputInfo, int32_t * pOutErrorCode );
 
 	// Function wrap hooks
-	int32_t InitFunctionHookByName(Hook_Info** OutputInfo, bool WrapFunction, bool CheckKBase, const char* ModulName, const char* FName, void* HookedF, int32_t* OutErrorCode);
-	int32_t InitFunctionHookByAddress(Hook_Info** OutputInfo, bool WrapFunction, void* Target, void* HookedF, int32_t* OutErrorCode);
+	int32_t InitFunctionHookByName( Hook_Info ** OutputInfo, bool WrapFunction, bool CheckKBase, const char * ModulName, const char * FName, void * HookedF, int32_t * OutErrorCode );
+	int32_t InitFunctionHookByAddress( Hook_Info ** OutputInfo, bool WrapFunction, void * Target, void * HookedF, int32_t * OutErrorCode );
 
 	// Memory custom hook
-	int32_t InitHookCustomData(Hook_Info** OutputInfo, void* Target, void* CustomData, size_t CSize, int32_t* OutErrorCode);
+	int32_t InitHookCustomData( Hook_Info ** OutputInfo, void * Target, void * CustomData, size_t CSize, int32_t * OutErrorCode );
 
 	// UnHook
-	bool UnHookRegisteredData(int32_t HookID, int32_t* OutErrorCode);
-	bool HookAgainRegisteredData(int32_t HookID, int32_t* OutErrorCode);
+	bool UnHookRegisteredData( int32_t HookID, int32_t * OutErrorCode );
+	bool HookAgainRegisteredData( int32_t HookID, int32_t * OutErrorCode );
 
 	// Init And shut down
-	bool ServiceGlobalInit(int32_t* OutErrorCode);
-	bool ServiceGlobalShutDown(bool UnHook, int32_t* OutErrorCode);
+	bool ServiceGlobalInit( int32_t * OutErrorCode );
+	bool ServiceGlobalShutDown( bool UnHook, int32_t * OutErrorCode );
 
 	// Informations
-	bool RetrieveHookInfoByID(Hook_Info** OutputInfo, int32_t HookID, int32_t* OutErrorCode);
-	bool RetrieveHookIDByInfo(Hook_Info* InputInfo, int32_t* OutHookID, int32_t* OutErrorCode);
+	bool RetrieveHookInfoByID( Hook_Info ** OutputInfo, int32_t HookID, int32_t * OutErrorCode );
+	bool RetrieveHookIDByInfo( Hook_Info * InputInfo, int32_t * OutHookID, int32_t * OutErrorCode );
 
-	bool ServiceRegisterHookInformation(Hook_Info* InputInfo, int32_t HookID, int32_t* OutErrorCode);
-	bool ServiceUnRegisterHookInformation(int32_t HookID, int32_t* OutErrorCode);
+	bool ServiceRegisterHookInformation( Hook_Info * InputInfo, int32_t HookID, int32_t * OutErrorCode );
+	bool ServiceUnRegisterHookInformation( int32_t HookID, int32_t * OutErrorCode );
 
 	// Arch
 	bool Is64BitProcess();
 
 	// Error handler 
-	const char* CHRetrieveErrorCodeString(int32_t InErrorCode);
+	const char * CHRetrieveErrorCodeString( int32_t InErrorCode );
 }
